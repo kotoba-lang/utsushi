@@ -27,14 +27,30 @@ capability-gated host import に隔離する」哲学と、kasane の「純 cljc
 - **effect soundness (T2)** — 「純フィルタ」が裏で fs/net に出れば**コンパイルが落ちる**
 - **content-addressing** — 同一入力 + 同一 filtergraph → 同一出力 CID で自動メモ化
 
-## R0（現状）
+## R0（実装済み — 最初の E2E が green）
 
-- `utsushi.container` — ISO BMFF box ツリーの最小スキャナ（mdat は境界のみ）
-- `grammar/mp4.edn` — kasane.decode 用の EDN 文法（立ち上がり次第委譲）
-- `utsushi.{bitstream,codec,graph,quads}` — 設計に沿った骨組み（多くは TODO）
+**MP4 demux → packet を content-id(CID) 化 → 再エンコードなし trim/concat → remux** が
+動作する。codec 実復号には触れない（opaque）。
 
-R0 の最初の E2E ゴール: **MP4 demux → packet を blob(CID) 化 → 再エンコードなし trim/concat
-→ remux**。codec 実復号は R1（capability-gated native host word）。
+- `utsushi.bytes` — big-endian の read/write プリミティブ（純 cljc）
+- `utsushi.container` — ISO BMFF box ツリーのスキャナ + `leaf-payload`（mdat は境界のみ）
+- `utsushi.demux` — stbl サンプルテーブル(stts/stsz/stsc/stco/co64/stss)を読み、各 sample の
+  offset/size/pts/keyframe を復元。sample bytes は `utsushi.blob/content-id` で参照化。
+  stsd(codec config) は opaque な raw bytes として保持
+- `utsushi.mux` — 最小 MP4 ライタ（`ftyp+mdat+moov` の mdat-first で chunk offset を一発計算、
+  stsd verbatim 再emit）
+- `utsushi.remux` — `trim`（pts 窓で sample 選択）/ `concat-streams`（track 連結 + pts シフト）
+- `utsushi.blob` — content-id（R0 placeholder = FNV-1a32。真の CID は Vault blake3）
+- `grammar/mp4.edn` — kasane.decode 用の EDN 文法（kasane 立ち上がり次第こちらへ委譲）
+- `utsushi.{bitstream,codec,graph,quads}` — 設計に沿った骨組み（bitstream/codec は R1 で実装）
+
+**検証**: `test/utsushi/e2e_test.cljc` が mux→demux→(trim/concat)→remux→demux の round-trip
+不変条件（sample 集合・pts・keyframe・cid・bytes 一致）を確認。外部メディアファイル/プレーヤー
+不要。`bb -cp src:test -e '(require (quote utsushi.e2e-test)) (utsushi.e2e-test/run)'` → `:ok`。
+
+### 次（R1）
+codec 実復号/符号化を capability-gated native host word（専用 `media`/`codec` WIT interface,
+`bind_evm`/`bind_btc` パターン）で。filtergraph(`utsushi.graph`)を kotoba `defgraph` に射影。
 
 ## ライセンス
 
