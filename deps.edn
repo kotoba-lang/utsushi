@@ -1,0 +1,13 @@
+;; utsushi（映し）— 時間ベースメディア（動画/音声）の純 cljc + EDN ライブラリ。
+;; 設計 SSoT: 90-docs/adr/2606272200-utsushi-video-edn-filtergraph.md (ADR-2606272200)
+;;
+;; 方針（ADR §0）:
+;;   ① コンテナ demux/mux  … 純 cljc + EDN 文法（将来 kasane.decode に委譲）— 外部依存ゼロ
+;;   ② ビットストリーム      … 純 cljc（NAL/SPS/ADTS のフレーミング・メタのみ）— 外部依存ゼロ
+;;   ③ codec カーネル        … R0 opaque / R1 capability-gated native（kotoba-clj host word）
+;;   ④ filtergraph           … kotoba defgraph への射影（データ）
+;; codec native(R1) を除き runtime/native 依存を持たない。
+{:paths ["src" "grammar"]
+ :deps  {}
+ :aliases
+ {:test {:extra-paths ["test"]}}}

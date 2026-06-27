@@ -1,0 +1,16 @@
+/.cpcache/
+/.clj-kondo/.cache/
+/.lsp/.cache/
+/target/
+*.class
+.DS_Store
+;; メディア実体は持ち込まない（B2+DataLad / Vault blob 経由）
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.ts
+*.wav
+*.aac
+*.h264
+*.h265
