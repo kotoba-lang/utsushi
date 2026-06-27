@@ -48,9 +48,25 @@ capability-gated host import に隔離する」哲学と、kasane の「純 cljc
 不変条件（sample 集合・pts・keyframe・cid・bytes 一致）を確認。外部メディアファイル/プレーヤー
 不要。`bb -cp src:test -e '(require (quote utsushi.e2e-test)) (utsushi.e2e-test/run)'` → `:ok`。
 
-### 次（R1）
-codec 実復号/符号化を capability-gated native host word（専用 `media`/`codec` WIT interface,
-`bind_evm`/`bind_btc` パターン）で。filtergraph(`utsushi.graph`)を kotoba `defgraph` に射影。
+## R1 + Pregel（実装済み — capability-gated codec + BSP filtergraph が green）
+
+ADR §3/§4 を cljc で realize（kotoba `policy.rs`/`effects.rs`/fuel/Pregel の鏡写し）。
+
+- `utsushi.policy` — deny-by-default capability + effect soundness(T2) + per-frame gas。
+  `deny-all`/`grant`/`with-gas-limit`/`check-graph`
+- `utsushi.codec` — R1 façade（実 decode/encode は native host word 境界。cljc は opaque）
+- `utsushi.graph` — filtergraph をデータ（node `{:id :op :args :effect}` + edge）で構築
+- `utsushi.pregel` — filtergraph を **BSP superstep で決定論実行**。`filtergraph-cid`
+  （= kotoba graph_def_cid 相当）/ per-frame gas（fuel 相当）/ `transcode` の CID-MV メモ化
+
+**検証**: `test/utsushi/pregel_test.cljc` が deny-by-default 拒否・under-declaration 拒否(T2)・
+per-frame gas 会計・gas 上限 trap(fuel)・BSP 決定論・同一 input+graph のメモ化を確認 → `:ok`。
+
+### 残るランタイム統合
+- kotoba-runtime に native `media`/`codec` WIT interface（`bind_evm`/`bind_btc` パターン）+
+  `kotoba-clj` の `CapClass::MediaDecode/Encode` + `:media-decode/:media-encode` effect を追加し、
+  cljc façade を実 native host word に接続（真の DCT/動き補償等）。
+- `utsushi.graph`/`utsushi.pregel` を kotoba `defgraph` + Pregel BSP に射影（現状は cljc 実現）。
 
 ## ライセンス
 
