@@ -4,7 +4,10 @@
 /target/
 *.class
 .DS_Store
-;; メディア実体は持ち込まない（B2+DataLad / Vault blob 経由）
+;; メディア実体は持ち込まない（B2+DataLad / Vault blob 経由）。
+;; 例外: test/fixtures 配下の数KB級テスト用実ファイルは org-iso-h264/org-iso-aac
+;; 前例（resources/*/fixtures/sample.*）に倣いコミット対象（B2/DataLadの対象は
+;; もっと大きい実データセットのみ）。
 *.mp4
 *.mov
 *.mkv
@@ -14,3 +17,4 @@
 *.aac
 *.h264
 *.h265
+!resources/utsushi/fixtures/*.mp4
