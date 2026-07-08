@@ -7,11 +7,15 @@
   - `filtergraph-cid` = topology の content-id（= kotoba graph_def_cid 相当、クロージャ非含有）。
   - capability/effect は実行前に utsushi.policy/check-graph で検査（deny-by-default + T2）。
   - per-frame gas 会計で総コストを上限拘束（fuel 相当）。
-  - 同一 input-cid + 同一 filtergraph-cid → 同一 output、`transcode` が CID-MV cache でメモ化。"
-  (:require [utsushi.bytes :as b]
-            [utsushi.blob :as blob]
-            [utsushi.demux :as demux]
-            [utsushi.remux :as remux]
+  - 同一 input-cid + 同一 filtergraph-cid → 同一 output、`transcode` が CID-MV cache でメモ化。
+
+  コンテナ操作（demux/remux/bytes/blob）は org-iso-isobmff へ抽出済み（kotoba-lang
+  reverse-domain media/graphics standards-substrate split, com-junkawasaki/root
+  ADR 前例2607072500）— utsushi はそれに依存する filtergraph オーケストレータになる。"
+  (:require [isobmff.bytes :as b]
+            [isobmff.blob :as blob]
+            [isobmff.demux :as demux]
+            [isobmff.remux :as remux]
             [utsushi.codec :as codec]
             [utsushi.policy :as policy]))
 
