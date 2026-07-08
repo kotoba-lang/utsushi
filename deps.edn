@@ -6,13 +6,17 @@
 ;;      kasane.isobmff と統合）。utsushi はそれに依存する filtergraph オーケストレータ。
 ;;   ② ビットストリーム（NAL/SPS/ADTS/Opus framing）… org-iso-h264/org-iso-aac/org-ietf-opus
 ;;      へ新規実装として切り出し済み（utsushi.bitstream は未実装 TODO stub だったため）。
+;;      utsushi.codec は org-iso-h264 だけを消費する（avcC埋め込みSPSの実解析）。
+;;      AAC/Opusは demux 済みsampleに対して適用対象が存在しないため未配線
+;;      （理由は utsushi.codec のdocstring参照）。
 ;;   ③ codec カーネル        … R0 opaque / R1 capability-gated native（kotoba-clj host word）
 ;;   ④ filtergraph           … kotoba defgraph への射影（データ）、Pregel BSP 実行
 ;; utsushi 自身に残るのは filtergraph オーケストレーション + capability/effect/gas モデルの
 ;; kotoba 鏡写しという「utsushi 固有の知的財産」だけ。コンテナ/コーデック仕様の実装は
 ;; 各 reverse-domain repo に委ねる（com-junkawasaki/root ADR 前例2607072500）。
-{:paths ["src"]
- :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}}
+{:paths ["src" "resources"]
+ :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "e1cd2e0711a528177750641f014627451cdc2e19"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
