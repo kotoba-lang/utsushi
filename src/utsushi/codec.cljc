@@ -8,8 +8,11 @@
   cljc 側はその native 境界を表現する façade:
    - capability/effect の検査と per-frame gas 会計は utsushi.policy + utsushi.pregel が担う。
    - ここでは『native を呼んだ』という stage 遷移のみ行い、bytes は opaque passthrough する
-     （真の変換は native host word。R1 cljc では opaque）。"
-  (:require [utsushi.blob :as blob]))
+     （真の変換は native host word。R1 cljc では opaque）。
+   コンテナ層（demux/mux/remux/bytes/blob）は org-iso-isobmff へ抽出済み
+   （kotoba-lang reverse-domain media/graphics standards-substrate split,
+   com-junkawasaki/root ADR 前例2607072500）。"
+  (:require [isobmff.blob :as blob]))
 
 (defn frame-count
   "demux 構造の総 sample(frame) 数。per-frame gas 会計に使う。"

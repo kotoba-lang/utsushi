@@ -1,13 +1,20 @@
 ;; utsushi（映し）— 時間ベースメディア（動画/音声）の純 cljc + EDN ライブラリ。
 ;; 設計 SSoT: 90-docs/adr/2606272200-utsushi-video-edn-filtergraph.md (ADR-2606272200)
 ;;
-;; 方針（ADR §0）:
-;;   ① コンテナ demux/mux  … 純 cljc + EDN 文法（将来 kasane.decode に委譲）— 外部依存ゼロ
-;;   ② ビットストリーム      … 純 cljc（NAL/SPS/ADTS のフレーミング・メタのみ）— 外部依存ゼロ
+;; 方針（ADR §0、2026-07-08 改訂 — reverse-domain split）:
+;;   ① コンテナ demux/mux/remux/bytes/blob … org-iso-isobmff へ抽出済み（ISO/IEC 14496-12、
+;;      kasane.isobmff と統合）。utsushi はそれに依存する filtergraph オーケストレータ。
+;;   ② ビットストリーム（NAL/SPS/ADTS/Opus framing）… org-iso-h264/org-iso-aac/org-ietf-opus
+;;      へ新規実装として切り出し済み（utsushi.bitstream は未実装 TODO stub だったため）。
 ;;   ③ codec カーネル        … R0 opaque / R1 capability-gated native（kotoba-clj host word）
-;;   ④ filtergraph           … kotoba defgraph への射影（データ）
-;; codec native(R1) を除き runtime/native 依存を持たない。
-{:paths ["src" "grammar"]
- :deps  {}
+;;   ④ filtergraph           … kotoba defgraph への射影（データ）、Pregel BSP 実行
+;; utsushi 自身に残るのは filtergraph オーケストレーション + capability/effect/gas モデルの
+;; kotoba 鏡写しという「utsushi 固有の知的財産」だけ。コンテナ/コーデック仕様の実装は
+;; 各 reverse-domain repo に委ねる（com-junkawasaki/root ADR 前例2607072500）。
+{:paths ["src"]
+ :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}}
  :aliases
- {:test {:extra-paths ["test"]}}}
+ {:test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :main-opts ["-m" "cognitect.test-runner"]}}}

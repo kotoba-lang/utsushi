@@ -1,9 +1,10 @@
 (ns utsushi.pregel-test
   "R1 + Pregel E2E: filtergraph を BSP で決定論実行し、capability(deny-by-default)・
   effect soundness(T2)・gas(fuel)・content-addressed メモ化を検証する（ADR §3/§4）。"
-  (:require [utsushi.mux :as mux]
-            [utsushi.demux :as demux]
-            [utsushi.blob :as blob]
+  (:require [clojure.test :refer [deftest is testing]]
+            [isobmff.mux :as mux]
+            [isobmff.demux :as demux]
+            [isobmff.blob :as blob]
             [utsushi.graph :as graph]
             [utsushi.policy :as policy]
             [utsushi.pregel :as pregel]))
@@ -46,58 +47,53 @@
        (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e
          (= kind (:kind (ex-data e))))))
 
-(defn run []
-  ;; --- 1) BSP 決定論 + re-encode-free pipeline は deny-all でも通る（effect 宣言なし） ---
+(deftest bsp-determinism-and-re-encode-free-pipeline
   (let [pol (policy/deny-all)
         r1  (pregel/run pipe-cut input pol)
         r2  (pregel/run pipe-cut input pol)]
-    (assert (= 3 (:supersteps r1)) "3 supersteps (demux→trim→mux)")
-    (assert (some? (:output-cid r1)) "produced output cid")
-    (assert (= (:output-cid r1) (:output-cid r2)) "deterministic: same output cid")
-    (assert (string? (:graph-cid r1)) "filtergraph-cid present")
-    ;; trim 後 demux で sample 数を確認（video pts<300 → 3、audio pts<300 → 4）
-    (let [d (demux/demux (:bytes (:output r1)))]
-      (assert (= 3 (count (:samples (first (:tracks d))))) "cut video → 3 samples")
-      (assert (= 4 (count (:samples (second (:tracks d))))) "cut audio → 4 samples")))
+    (is (= 3 (:supersteps r1)) "3 supersteps (demux→trim→mux)")
+    (is (some? (:output-cid r1)) "produced output cid")
+    (is (= (:output-cid r1) (:output-cid r2)) "deterministic: same output cid")
+    (is (string? (:graph-cid r1)) "filtergraph-cid present")
+    (testing "trim 後 demux で sample 数を確認（video pts<300 → 3、audio pts<300 → 4）"
+      (let [d (demux/demux (:bytes (:output r1)))]
+        (is (= 3 (count (:samples (first (:tracks d))))))
+        (is (= 4 (count (:samples (second (:tracks d))))))))))
 
-  ;; --- 2) capability: transcode pipeline は deny-all で拒否される ---
-  (assert (threw? #(pregel/run pipe-xcode input (policy/deny-all)) :capability-denied)
-          "deny-by-default rejects ungranted :media-decode")
+(deftest capability-denies-ungranted-effect
+  (is (threw? #(pregel/run pipe-xcode input (policy/deny-all)) :capability-denied)
+      "deny-by-default rejects ungranted :media-decode"))
 
-  ;; --- 3) effect soundness(T2): node effect が graph :effects に無いと拒否 ---
+(deftest effect-soundness-t2
   (let [bad (assoc pipe-xcode :effects #{})]   ; decode/encode を宣言から外す
-    (assert (threw? #(pregel/run bad input (policy/grant (policy/deny-all)
-                                                         :media-decode :media-encode))
-                    :under-declaration)
-            "under-declaration rejected even if granted"))
+    (is (threw? #(pregel/run bad input (policy/grant (policy/deny-all)
+                                                      :media-decode :media-encode))
+                :under-declaration)
+        "under-declaration rejected even if granted")))
 
-  ;; --- 4) grant すれば実行でき、per-frame gas を消費する ---
+(deftest grant-executes-and-consumes-gas
   (let [pol (-> (policy/deny-all)
                 (policy/grant :media-decode)
                 (policy/grant :media-encode))
         r   (pregel/run pipe-xcode input pol)]
-    (assert (= 4 (:supersteps r)) "4 supersteps (demux→decode→encode→mux)")
+    (is (= 4 (:supersteps r)) "4 supersteps (demux→decode→encode→mux)")
     ;; gas = demux50 + decode(1000*10) + encode(1500*10) + mux50 = 25100
-    (assert (= 25100 (:gas r)) (str "per-frame gas accounting, got " (:gas r)))
-    (assert (some? (:output-cid r)) "transcode produced output"))
+    (is (= 25100 (:gas r)) (str "per-frame gas accounting, got " (:gas r)))
+    (is (some? (:output-cid r)) "transcode produced output")))
 
-  ;; --- 5) fuel: gas 上限を超えると trap ---
+(deftest fuel-gas-ceiling-traps
   (let [pol (-> (policy/deny-all)
                 (policy/grant :media-decode) (policy/grant :media-encode)
                 (policy/with-gas-limit 5000))]   ; decode 10000 > 5000
-    (assert (threw? #(pregel/run pipe-xcode input pol) :out-of-gas)
-            "gas ceiling traps the run (fuel)"))
+    (is (threw? #(pregel/run pipe-xcode input pol) :out-of-gas)
+        "gas ceiling traps the run (fuel)")))
 
-  ;; --- 6) content-addressed メモ化: 同一 input+graph の 2 回目は cache hit ---
+(deftest content-addressed-memoization
   (let [pol   (-> (policy/deny-all) (policy/grant :media-decode) (policy/grant :media-encode))
         cache (atom {})
         a (pregel/transcode pipe-xcode input pol cache)
         b (pregel/transcode pipe-xcode input pol cache)]
-    (assert (false? (:cached a)) "first run computes")
-    (assert (true? (:cached b)) "second run is cache hit")
-    (assert (= (:output-cid a) (:output-cid b)) "memoized output cid identical")
-    (assert (= 1 (count @cache)) "single cache entry for same input+graph"))
-
-  :ok)
-
-(comment (run))
+    (is (false? (:cached a)) "first run computes")
+    (is (true? (:cached b)) "second run is cache hit")
+    (is (= (:output-cid a) (:output-cid b)) "memoized output cid identical")
+    (is (= 1 (count @cache)) "single cache entry for same input+graph")))
