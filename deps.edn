@@ -16,7 +16,7 @@
 ;; 各 reverse-domain repo に委ねる（com-junkawasaki/root ADR 前例2607072500）。
 {:paths ["src" "resources"]
  :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
-         io.github.kotoba-lang/org-iso-h264    {:git/sha "e1cd2e0711a528177750641f014627451cdc2e19"}}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "a6ed8581fb83d0a4b7c796012135a380282aef65"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
