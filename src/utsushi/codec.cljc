@@ -31,8 +31,10 @@
   この follow-up のスコープ外 — 新機能であって『配線』ではない）。"
   (:require [isobmff.blob :as blob]
             [isobmff.box :as box]
+            [isobmff.bytes :as by]
             [h264.rbsp :as rbsp]
-            [h264.sps :as sps]))
+            [h264.sps :as sps]
+            [h264.pps :as pps]))
 
 (defn frame-count
   "demux 構造の総 sample(frame) 数。per-frame gas 会計に使う。"
@@ -94,7 +96,66 @@
                       tracks)))
       demuxed)))
 
+;; ---- H.264 encode: :params (width/height/profile-idc/level-idc) → avcC-embedded :stsd ----
+;; Wave 4 wiring (ADR-2607121400): the encode-side mirror of h264-track-params
+;; above. org-iso-h264's h264.sps/encode + h264.pps/encode only produce
+;; parameter-set NALUs (no macroblock/pixel/CAVLC/CABAC — see org-iso-h264's
+;; own docstrings), so this wires exactly that scope: given a video track's
+;; :params (the same shape decode above produces), synthesize a real avcC
+;; (AVCDecoderConfigurationRecord, ISO/IEC 14496-15) box embedding an encoded
+;; SPS+PPS, wrapped in a minimal avc1 VisualSampleEntry + stsd box — the same
+;; byte layout find-avcc/h264-track-params reads. This does NOT produce
+;; encoded frame data (no :samples bytes are written) — only the parameter-set
+;; portion of the container metadata. Round-trip verified against decode in
+;; codec_test.cljc.
+
+(defn- h264-avcc-payload
+  "AVCDecoderConfigurationRecord payload embedding one SPS + one PPS NALU
+   built from `params` ({:profile-idc :level-idc :width :height}). Byte
+   layout matches what h264-track-params/find-avcc read (configVersion,
+   profile_idc, profile_compatibility, level_idc, lengthSizeMinusOne,
+   reserved+numSPS, sps-len16, sps-bytes, numPPS, pps-len16, pps-bytes)."
+  [{:keys [profile-idc level-idc] :as params}]
+  (let [sps (rbsp/escape (sps/encode params))
+        pp  (rbsp/escape (pps/encode {}))]
+    (vec (concat [1 profile-idc 0 level-idc 0xff]      ; configVersion/profile_idc/profile_compat/level_idc/lengthSizeMinusOne(=4)
+                 [(bit-or 0xE0 1)]                       ; reserved(111)+numOfSequenceParameterSets(1)
+                 (by/wu16 (count sps)) sps
+                 [1]                                     ; numOfPictureParameterSets
+                 (by/wu16 (count pp)) pp))))
+
+(defn- h264-avcc-stsd
+  "Minimal `stsd` box bytes (FullBox header + entry-count=1 + one `avc1`
+   VisualSampleEntry wrapping the avcC box from `h264-avcc-payload`) — the
+   exact shape find-avcc/h264-track-params parse back out. The 78
+   VisualSampleEntry fixed fields (after avc1's own 8-byte box header,
+   totalling the 86-byte visual-sample-entry-fixed-header find-avcc skips)
+   are zero-filled: decode never reads them (width/height come from the SPS,
+   not the box's own width/height fields), only their byte count matters."
+  [params]
+  (let [avcc-payload (h264-avcc-payload params)
+        avcc-box     (vec (concat (by/wu32 (+ 8 (count avcc-payload))) (by/wstr "avcC") avcc-payload))
+        avc1-fixed   (vec (repeat 78 0))
+        avc1-box     (vec (concat (by/wu32 (+ 86 (count avcc-box))) (by/wstr "avc1")
+                                   avc1-fixed avcc-box))
+        stsd-body    (vec (concat [0 0 0 0] (by/wu32 1) avc1-box))] ; FullBox version/flags(4) + entry-count(4)
+    (vec (concat (by/wu32 (+ 8 (count stsd-body))) (by/wstr "stsd") stsd-body))))
+
 (defn encode
-  "native encode 境界（R1: opaque passthrough）。:stage を :encoded にする。"
-  [_policy _codec _opts demuxed]
-  (assoc demuxed :stage :encoded))
+  "native encode 境界。R1: bytes は opaque passthrough（:stage を :encoded に
+   する）が、codec=:h264 のときだけ、各 video track の :params
+   （width/height/profile-idc/level-idc — decode が生成するのと同じ形）から
+   avcC 埋め込み :stsd を実合成する（org-iso-h264 の SPS/PPS encode +
+   emulation-prevention escape）。パラメータセット層のみ — 画素/フレームは
+   まだ encode しない（org-iso-h264 自身のスコープ限定と同じ）。"
+  [_policy codec _opts demuxed]
+  (let [demuxed (assoc demuxed :stage :encoded)]
+    (if (= codec :h264)
+      (update demuxed :tracks
+              (fn [tracks]
+                (mapv (fn [t]
+                        (if (and (= (:handler t) "vide") (:params t))
+                          (assoc t :stsd (h264-avcc-stsd (:params t)))
+                          t))
+                      tracks)))
+      demuxed)))
