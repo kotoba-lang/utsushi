@@ -61,7 +61,14 @@
       (testing "cross-check: the Store-persisted result is identical to
                 decode-first-h264-frame's own (non-persisted) result for the
                 SAME mp4 bytes — same Annex B bytes decoded twice, once
-                outside the Store and once through it, agree exactly"
-        (is (= (pipeline/decode-first-h264-frame mp4-bytes) (:decode/frame-blob job))))
+                outside the Store and once through it, agree exactly (on the
+                :width/:height/:luma subset the Store actually persists —
+                see utsushi.codec.store's decode-schema docstring: the Store
+                deliberately only captures {:width :height :luma}, not the
+                newer :cb/:cr/:mb-pred-modes/:mb-intra-chroma-pred-modes keys
+                org-iso-h264's decode-idr-frame has grown to return since
+                this test's org-iso-h264 pin was last advanced)"
+        (is (= (select-keys (pipeline/decode-first-h264-frame mp4-bytes) [:width :height :luma])
+               (:decode/frame-blob job))))
       (testing "job is re-fetchable via job-entity after the fact (not just the return value)"
         (is (= job (store/job-entity conn "mp4-job-1" {})))))))
