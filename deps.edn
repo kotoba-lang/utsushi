@@ -14,9 +14,16 @@
 ;; utsushi 自身に残るのは filtergraph オーケストレーション + capability/effect/gas モデルの
 ;; kotoba 鏡写しという「utsushi 固有の知的財産」だけ。コンテナ/コーデック仕様の実装は
 ;; 各 reverse-domain repo に委ねる（com-junkawasaki/root ADR 前例2607072500）。
+;;
+;; decode-state Store（ADR-2607122000 Migration手順5）: org-iso-h264 を
+;; a6ed858（framing/SPS/PPS のみ）→ daccb23（h264.decode/decode-idr-frame、
+;; 実画素 baseline intra decode 追加、Wave 3）へ更新。langchain は
+;; utsushi.codec.store の `:db-api` 注入パターン（MemStore ≡ DatomicStore
+;; contract、actor 系と同型）の手本かつ実体（langchain.db/api）。
 {:paths ["src" "resources"]
  :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
-         io.github.kotoba-lang/org-iso-h264    {:git/sha "a6ed8581fb83d0a4b7c796012135a380282aef65"}}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "daccb23a139a251ff0e63faaaf8040c8fd18680b"}
+         io.github.kotoba-lang/langchain       {:git/sha "0f966d06c93d7fc76b0790fdece4c391dc257eb1"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

@@ -18,3 +18,7 @@
 *.h264
 *.h265
 !resources/utsushi/fixtures/*.mp4
+;; ADR-2607122000 §4/Migration手順5: org-iso-h264 golden vector (flat16-dc-only),
+;; copied verbatim for utsushi.codec.store's integration test — same "small
+;; real fixture is committed" exception as the .mp4 rule above.
+!resources/utsushi/fixtures/*.h264
