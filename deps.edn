@@ -20,9 +20,15 @@
 ;; 実画素 baseline intra decode 追加、Wave 3）へ更新。langchain は
 ;; utsushi.codec.store の `:db-api` 注入パターン（MemStore ≡ DatomicStore
 ;; contract、actor 系と同型）の手本かつ実体（langchain.db/api）。
+;;
+;; h264-mp4 encode pipeline（画素→H.264 encode→MP4 mux、mp4-h264 の逆方向）:
+;; org-iso-h264 を daccb23 → 55ffcdd（`h264.encode`/`encode-idr-luma-frame`
+;; namespace そのもの — luma+chroma Intra_16x16 baseline encoder、Wave 5）へ
+;; 更新。daccb23 には `h264.encode` 自体が存在しない（この namespace は
+;; c107b41/2839cf5 で初めて追加された）ため、encode 方向の配線には必須の更新。
 {:paths ["src" "resources"]
  :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
-         io.github.kotoba-lang/org-iso-h264    {:git/sha "daccb23a139a251ff0e63faaaf8040c8fd18680b"}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "55ffcddacd3aafeb530a13bdf1532c261c947b23"}
          io.github.kotoba-lang/langchain       {:git/sha "0f966d06c93d7fc76b0790fdece4c391dc257eb1"}}
  :aliases
  {:test {:extra-paths ["test"]
