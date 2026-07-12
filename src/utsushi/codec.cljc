@@ -49,11 +49,13 @@
 
 (def ^:private visual-sample-entry-fixed-header 86)
 
-(defn- find-avcc
+(defn find-avcc
   "stsd(raw bytes — isobmff.demuxはstsdの**外側box header込み**でsliceする点に
    注意: box header(8) + FullBox version/flags(4) + entry-count(4) = 16byte
    の後にサンプルエントリが1つ以上続く) から avcC box の payload を返す
-   （無ければ nil）。"
+   （無ければ nil）。public: h264-track-params 以外に
+   `utsushi.pipeline.mp4-h264`（実画素パイプライン, ADR-2607122000 Phase 1
+   統合実証）からも同じ avcC 抽出ロジックを再利用する。"
   [stsd-bytes]
   (let [buf (vec stsd-bytes)
         entry-start 16                                    ; stsd box header(8) + FullBox(4) + entry-count(4)
@@ -65,6 +67,46 @@
                                        (+ (:start entry) (:size entry)))
             avcc (box/find-box children "avcC")]
         (when avcc (box/leaf-payload buf avcc))))))
+
+(defn- avcc-nalu-list
+  "Parse `n` consecutive length16-prefixed NAL units (each length prefixed
+   by a big-endian u16, matching AVCDecoderConfigurationRecord's
+   sequenceParameterSetNALUnit/pictureParameterSetNALUnit repetition,
+   ISO/IEC 14496-15 §5.2.4.1) starting at `off` within `buf`. Returns
+   [nalus next-offset] — nalus include their 1-byte NAL header (matching
+   the shape `h264.bitstream/nal-units` attaches under :bytes)."
+  [buf off n]
+  (loop [i 0 off off acc []]
+    (if (= i n)
+      [acc off]
+      (let [len (bit-or (bit-shift-left (nth buf off) 8) (nth buf (inc off)))
+            start (+ off 2)
+            end (+ start len)]
+        (recur (inc i) end (conj acc (subvec buf start end)))))))
+
+(defn avcc-config
+  "avcC box payload (as returned by `find-avcc`) → {:length-size (1..4,
+   bytes) :sps-nalus [byte-vec...] :pps-nalus [byte-vec...]}. Each nalu
+   byte-vec includes its 1-byte NAL header, ready to be wrapped in Annex B
+   start codes (`utsushi.pipeline.mp4-h264/nalus->annexb`) for
+   `org-iso-h264`'s `h264.decode/decode-idr-frame`, which only accepts
+   Annex B start-code-delimited streams — never AVCC length-prefixed
+   samples directly.
+
+   Byte layout (ISO/IEC 14496-15 AVCDecoderConfigurationRecord):
+   byte0=configurationVersion byte1=AVCProfileIndication
+   byte2=profile_compatibility byte3=AVCLevelIndication
+   byte4=reserved(6)+lengthSizeMinusOne(2) byte5=reserved(3)+numOfSPS(5)
+   then numOfSPS × (u16 length + SPS NALU), then numOfPPS(u8), then
+   numOfPPS × (u16 length + PPS NALU)."
+  [avcc-bytes]
+  (let [buf (vec avcc-bytes)
+        length-size (inc (bit-and (nth buf 4) 0x03))
+        num-sps (bit-and (nth buf 5) 0x1F)
+        [sps-nalus off1] (avcc-nalu-list buf 6 num-sps)
+        num-pps (nth buf off1)
+        [pps-nalus _off2] (avcc-nalu-list buf (inc off1) num-pps)]
+    {:length-size length-size :sps-nalus sps-nalus :pps-nalus pps-nalus}))
 
 (defn h264-track-params
   "track の :stsd（raw box bytes）から avcC 経由で最初の SPS を取り出し、
