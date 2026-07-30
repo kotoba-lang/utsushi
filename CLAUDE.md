@@ -21,6 +21,7 @@
 | `utsushi.container` | ① ISO BMFF box ツリー（R0 手書き → kasane.decode + grammar/mp4.edn） |
 | `utsushi.bitstream` | ② NAL/SPS/ADTS のフレーミング・メタ（ヘッダのみ） |
 | `utsushi.codec`     | ③ R0 opaque passthrough / R1 native host word façade |
+| `utsushi.backend`   | ③ codec 実装カタログと選択（façade が dispatch する先。上の不変条件が実測で裏付けられた記録もここ） |
 | `utsushi.graph`     | ④ filtergraph を EDN で組み立て kotoba defgraph へ射影 |
 | `utsushi.quads`     | フレーム/パケット/メタ → `media/*` Datom 射影（CID 参照） |
 
