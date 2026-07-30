@@ -11,15 +11,26 @@
 (def known-effects #{:media-decode :media-encode})
 
 ;; op → 誘発する effect（nil = 純粋, 権限不要）
+;; scale/pad/fit/hold/zoompan は `utsushi.raster` の画素演算で、entropy coding も
+;; native 呼び出しも含まないので effect は nil。ここに effect を付けると
+;; deny-by-default が「画素を触るだけの graph」まで拒否してしまい、逆に
+;; :media-decode を付けると effect モデルが嘘になる（実際には何も decode しない）。
 (def effect-of-op
   {:demux nil :trim nil :concat nil :mux nil
+   :scale nil :pad nil :fit nil :hold nil :zoompan nil
    :decode :media-decode :encode :media-encode})
 
-;; op の基本 gas。decode/encode は per-frame に乗算する。
+;; op の基本 gas。decode/encode と画素 filter は per-frame に乗算する。
+;; filter の gas は decode/encode より 1 桁小さい — 実測（2026-07-30）で
+;; 720x1280 の bilinear scale が 67 ms、同フレームの H.264 encode が 1,226 ms。
 (def gas-cost
-  {:demux 50 :trim 10 :concat 20 :mux 50 :decode 1000 :encode 1500})
+  {:demux 50 :trim 10 :concat 20 :mux 50
+   :scale 100 :pad 40 :fit 140 :hold 5 :zoompan 120
+   :decode 1000 :encode 1500})
 
-(def per-frame? #{:decode :encode})
+;; per-frame に gas が乗る op。画素 filter はフレームごとに走るので当然含む —
+;; ここから漏らすと 1800 フレームの graph が 1 フレーム分の見積りで通ってしまう。
+(def per-frame? #{:decode :encode :scale :pad :fit :zoompan})
 
 (defn deny-all
   "全 capability 不許可・既定 gas 上限のみの完全封じ込めポリシー。"
