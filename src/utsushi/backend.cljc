@@ -174,20 +174,30 @@
 
   理由を捨てずに返すのが要点 —— 「backend が無い」だけのエラーは、
   platform 違いなのか status なのか codec 非対応なのかを呼び手に伝えない。"
-  [op codec plat {:keys [allow-statuses] :or {allow-statuses executable-statuses}}]
+  [op codec plat {:keys [allow-statuses providers] :or {allow-statuses executable-statuses}}]
   (mapv (fn [{:keys [backend/id backend/ops backend/codecs backend/platforms backend/status]
               :as b}]
-          {:backend/id id
-           :backend/status status
-           :reason (cond
-                     (not (contains? ops op)) (str "op " op " を扱わない")
-                     (and codec (not= :any codecs) (not (contains? codecs codec)))
-                     (str "codec " codec " 非対応")
-                     (not (contains? platforms plat)) (str "platform " plat " で動かない")
-                     (not (contains? allow-statuses status))
-                     (str "status " status " —— " (get statuses status "不明"))
-                     :else nil)
-           :backend b})
+          (let [prov (let [p (get providers id)]
+                       (when (and p (contains? (:provider/ops p) op)) p))]
+            {:backend/id id
+             :backend/status status
+             :backend/provided? (some? prov)
+             :reason (cond
+                       (not (contains? ops op)) (str "op " op " を扱わない")
+                       (and codec (not= :any codecs) (not (contains? codecs codec)))
+                       (str "codec " codec " 非対応")
+                       (not (contains? platforms plat)) (str "platform " plat " で動かない")
+                       ;; provider が注入されていれば status を待たずに実行可能。
+                       ;; status は「utsushi 単体では」の話で、provider の有無は
+                       ;; その deployment の話だから。
+                       (and (not prov) (not (contains? allow-statuses status)))
+                       (str "status " status " —— " (get statuses status "不明")
+                            "（provider を注入すれば実行可能）")
+                       :else nil)
+             ;; カタログの :backend/provider は「誰の実装か」を書いた説明文字列
+             ;; なので、注入された executor は別のキーに置く。同じキーに入れると
+             ;; 「libavcodec (外部プロセス)」という文字列を関数として呼ぶことになる。
+             :backend (if prov (assoc b :backend/executor prov) b)}))
         backends))
 
 (defn available
@@ -197,6 +207,13 @@
   ([op codec plat] (available op codec plat {}))
   ([op codec plat opts]
    (mapv :backend (filter (comp nil? :reason) (rejections op codec plat opts)))))
+
+(defn- opts-of
+  "policy から rejections/select 用の opts を作る。`:backend/providers` を
+  拾い忘れると、注入した provider が選択に反映されない。"
+  [policy]
+  (-> (select-keys policy [:allow-statuses])
+      (assoc :providers (:backend/providers policy))))
 
 (defn select
   "`op`/`codec` を実行する backend を 1 つ選ぶ。`policy` の
@@ -208,7 +225,7 @@
   ([op codec] (select op codec {}))
   ([op codec policy] (select op codec policy (platform)))
   ([op codec policy plat]
-   (let [opts (select-keys policy [:allow-statuses])
+   (let [opts (opts-of policy)
          all (rejections op codec plat opts)
          ok (filter (comp nil? :reason) all)
          prefer (vec (:backend/prefer policy))
@@ -227,6 +244,83 @@
                        {:kind :no-backend :op op :codec codec :platform plat
                         :rejections (mapv #(select-keys % [:backend/id :backend/status :reason])
                                           all)}))))))
+
+;; ---- provider（executor の注入） ----------------------------------------
+;;
+;; カタログは「何が在りうるか」しか言えない。**実際に走るかは deployment の
+;; 性質**であって、library に焼ける事実ではない —— browser には WebCodecs が
+;; あり JVM には無い、ffmpeg は在る環境と無い環境がある。したがって executor は
+;; 呼び手が **provider として注入**し、utsushi は契約の検証と grant 強制だけを持つ。
+;;
+;; この形は発明ではなく `kototama.component-provider` の写しである。あちらは
+;; 「providers のキーは granted WIT imports と厳密一致しなければならない」
+;; 「capability 名だけでは authority ではない」「provider は invocation adapter を
+;; 露出しなければならない」を prepare! で強制する。同じ 3 点をここでも強制する。
+;;
+;; これで utsushi の不変条件（①②④ は純 cljc + EDN、外部依存ゼロ）は保たれる ——
+;; ffmpeg を spawn するコードも WebCodecs を叩くコードも utsushi には入らず、
+;; **契約だけが入る**。
+
+(defn provider
+  "backend `id` の executor を作る。`invoke` は `(fn [op args] result)`。
+
+  `ops` は**その provider が実際に提供する op**で、カタログがその backend に
+  宣言している op の**部分集合でなければならない** —— 宣言していない op を
+  provider が名乗れるなら、カタログは監査の役に立たない
+  （`kototama.component-provider`: 「capability 名だけでは authority ではない」）。"
+  [id ops invoke]
+  (let [b (by-id id)]
+    (when-not b
+      (throw (ex-info (str "未知の backend: " id)
+                      {:kind :unknown-backend :backend/id id
+                       :known (mapv :backend/id backends)})))
+    (when-not (ifn? invoke)
+      (throw (ex-info "provider は invocation adapter を露出しなければならない"
+                      {:kind :provider-not-invocable :backend/id id})))
+    (let [declared (:backend/ops b)
+          claimed (set ops)]
+      (when-not (seq claimed)
+        (throw (ex-info "provider は少なくとも 1 つの op を提供しなければならない"
+                        {:kind :provider-no-ops :backend/id id})))
+      (when-not (every? declared claimed)
+        (throw (ex-info (str "provider が宣言外の op を名乗っている: " id)
+                        {:kind :provider-op-not-declared :backend/id id
+                         :declared declared :claimed claimed
+                         :undeclared (into #{} (remove declared) claimed)})))
+      {:provider/backend id :provider/ops claimed :provider/invoke invoke})))
+
+(defn with-provider
+  "policy に provider を登録する。登録された backend は、その provider が提供する
+  op に限り **実行可能として扱われる** —— status が `:executor-absent` /
+  `:out-of-layer` でも。
+
+  status を書き換えるのではなく policy 側に持つのが要点である。カタログの
+  `:webcodecs` は「utsushi 単体では executor が無い」という**恒久的に正しい事実**で、
+  provider の有無は**その deployment の**事実だから、別の場所に住むべきである。"
+  [policy prov]
+  (update policy :backend/providers assoc (:provider/backend prov) prov))
+
+(defn provider-for
+  "policy に登録された、`id` が `op` を提供する provider（無ければ nil）。"
+  [policy id op]
+  (let [p (get-in policy [:backend/providers id])]
+    (when (and p (contains? (:provider/ops p) op)) p)))
+
+(defn provided?
+  "`id` は `op` について、この policy の下で実行可能か。"
+  [policy id op]
+  (some? (provider-for policy id op)))
+
+(defn invoke!
+  "選ばれた backend の provider を通して `op` を実行する。provider が無ければ
+  ex-info —— **カタログに載っていることと実行できることは別**であり、その区別を
+  実行時に潰さない。"
+  [backend op args]
+  (if-let [prov (:backend/executor backend)]
+    ((:provider/invoke prov) op args)
+    (throw (ex-info (str "backend " (:backend/id backend) " に provider が無い（op " op "）")
+                    {:kind :no-provider :backend/id (:backend/id backend) :op op
+                     :status (:backend/status backend)}))))
 
 ;; ---- gas ----------------------------------------------------------------
 

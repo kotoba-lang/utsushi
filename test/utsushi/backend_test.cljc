@@ -162,3 +162,81 @@
     #?(:clj (do (is (= :jvm (backend/platform)))
                 (is (false? (backend/webcodecs-video-encoder?))))
        :cljs (is (contains? #{:browser :node} (backend/platform))))))
+
+;; ---- provider（executor の注入） ---------------------------------------
+;;
+;; カタログは「何が在りうるか」しか言えない。実際に走るかは deployment の性質で
+;; あって library に焼ける事実ではない。この節は、その区別が保たれること —— 注入
+;; されるまで実行できず、注入されれば status を待たずに実行でき、宣言外の op を
+;; 名乗る provider は拒まれること —— を検査する。形は
+;; `kototama.component-provider/prepare!` の写しである。
+
+(defn- recording-provider
+  "呼ばれた op/args を記録するだけの provider（本物の ffmpeg/WebCodecs の代わり）。"
+  [id ops log]
+  (backend/provider id ops (fn [op args] (swap! log conj [op args]) {:ok id})))
+
+(deftest provider-must-match-what-the-catalog-declares
+  (testing "宣言外の op を名乗る provider は拒まれる —— capability 名だけでは authority ではない"
+    (let [d (ex-data (try (backend/provider :webcodecs #{:encode-pixels :demux} (fn [_ _] nil))
+                          (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))]
+      (is (= :provider-op-not-declared (:kind d)))
+      (is (= #{:demux} (:undeclared d)) ":webcodecs は demux を宣言していない")))
+  (testing "invocation adapter が無い provider は拒まれる"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                 (backend/provider :webcodecs #{:encode-pixels} "not-a-fn"))))
+  (testing "op を 1 つも提供しない provider は拒まれる"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                 (backend/provider :webcodecs #{} (fn [_ _] nil)))))
+  (testing "未知の backend は拒まれる"
+    (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                 (backend/provider :videotoolbox #{:encode-pixels} (fn [_ _] nil)))))
+  (testing "宣言の部分集合なら通る"
+    (let [p (backend/provider :ffmpeg #{:encode-pixels} (fn [_ _] :ok))]
+      (is (= :ffmpeg (:provider/backend p)))
+      (is (= #{:encode-pixels} (:provider/ops p))))))
+
+(deftest injecting-a-provider-makes-a-backend-runnable
+  (let [log (atom [])
+        pol (backend/with-provider {} (recording-provider :ffmpeg #{:encode-pixels} log))]
+    (testing "注入前は :cljc が選ばれる（:ffmpeg は out-of-layer）"
+      (is (= :cljc (:backend/id (backend/select :encode-pixels :h264 {} :jvm)))))
+    (testing "注入後は prefer で :ffmpeg を選べる —— status を書き換えずに"
+      (let [b (backend/select :encode-pixels :h264
+                              (assoc pol :backend/prefer [:ffmpeg]) :jvm)]
+        (is (= :ffmpeg (:backend/id b)))
+        (is (= :out-of-layer (:backend/status b))
+            "カタログの status は「utsushi 単体では」の恒久的事実なので変わらない")
+        (is (some? (:backend/executor b)))))
+    (testing "provider が提供していない op には効かない"
+      (is (= :cljc (:backend/id (backend/select :decode-pixels :h264
+                                                (assoc pol :backend/prefer [:ffmpeg]) :jvm)))))
+    (testing "platform 制約は provider では超えられない —— browser で外部プロセスは動かない"
+      (is (= :cljc (:backend/id (backend/select :encode-pixels :h264
+                                                (assoc pol :backend/prefer [:ffmpeg]) :browser)))))
+    (testing "invoke! は provider を通す"
+      (let [b (backend/select :encode-pixels :h264 (assoc pol :backend/prefer [:ffmpeg]) :jvm)]
+        (is (= {:ok :ffmpeg} (backend/invoke! b :encode-pixels {:frames 3})))
+        (is (= [[:encode-pixels {:frames 3}]] @log))))
+    (testing "provider の無い backend を invoke! すると、カタログに在ることと実行できることの区別が保たれる"
+      (let [d (ex-data (try (backend/invoke! (backend/by-id :webcodecs) :encode-pixels {})
+                            (catch #?(:clj clojure.lang.ExceptionInfo :cljs :default) e e)))]
+        (is (= :no-provider (:kind d)))
+        (is (= :executor-absent (:status d)))))))
+
+(deftest provided-backends-satisfy-the-graph-check
+  (testing "provider があれば、その codec の画素 graph が組めるようになる"
+    (let [g (graph/filtergraph
+             {:effects #{:media-encode}
+              :nodes [{:id :enc :op :encode :args {:codec :h265}}]
+              :edges []})
+          base (assoc granted :platform :jvm :require-pixel-backend? true)]
+      (testing "provider 無しでは :h265 の画素 backend が無く落ちる"
+        (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs :default)
+                     (policy/check-graph g base))))
+      (testing "ffmpeg provider を注入すると同じ graph が通る"
+        (is (map? (policy/check-graph
+                   g (-> base
+                         (backend/with-provider
+                           (backend/provider :ffmpeg #{:encode-pixels} (fn [_ _] :ok)))
+                         (assoc :backend/prefer [:ffmpeg])))))))))
