@@ -6,7 +6,20 @@
   demux/trim/mux 等の純コンテナ操作 = nil）。実行前に:
     1) node effect ⊆ graph 宣言 :effects（under-declaration 禁止 = T2 相当）
     2) node effect ∈ policy :granted（deny-by-default）
-  を検査し、実行中は per-frame gas 会計で総コストを上限拘束する（fuel 相当）。")
+  を検査し、実行中は per-frame gas 会計で総コストを上限拘束する（fuel 相当）。
+
+  R1 追加（2026-07-30、ADR-2800002800）: codec op は **どの backend が走るか**まで
+  検査する（`utsushi.backend`）。理由は 2 つ。
+
+  1. **platform で実行可能性が変わる。** `:encode` を browser で走らせる graph は、
+     組んだ時点では通って実行時に落ちていた。`check-graph` が backend の有無を
+     見れば、落ちるのは graph を組んだ時点になり、理由（platform / status /
+     codec 非対応のどれか）も具体的に出る。
+  2. **同じ op のコストが backend で 3 桁違う。** 実測で :cljc の H.264 encode が
+     18,140 ms/frame、ffmpeg が 16 ms/frame。gas を op だけで決めると、どちらが
+     走るかによって見積りが 1000 倍外れる。`graph-gas` は選ばれた backend の
+     実測倍率を掛ける。"
+  (:require [utsushi.backend :as backend]))
 
 (def known-effects #{:media-decode :media-encode})
 
@@ -65,5 +78,58 @@
           (when (and (:codec args) (seq (:codecs policy))
                      (not (contains? (:codecs policy) (:codec args))))
             (throw (ex-info (str "codec not granted: " (:codec args) " at node " id)
-                            {:node id :codec (:codec args) :kind :codec-denied}))))))
+                            {:node id :codec (:codec args) :kind :codec-denied})))
+          ;; backend の実行可能性。`backend/select` は却下理由を全部添えて投げる。
+          ;; ここで落とすと「graph を組んだ時点」で失敗するので、実行時に
+          ;; VideoEncoder undefined を踏むより早く、原因も具体的である。
+          ;;
+          ;; 既定では façade op（opaque passthrough + metadata）として検査する ——
+          ;; それが `utsushi.codec` が実際にやっていることで、任意の codec に対して
+          ;; 成立する。`:require-pixel-backend? true` を渡したときだけ、この graph の
+          ;; :decode/:encode を**実画素**処理として検査する。既定を画素にすると
+          ;; 「:h265 を opaque に通す」既存契約を壊す（実際に壊した）。
+          (when (contains? backend/facade-ops op)
+            (let [plat (or (:platform policy) (backend/platform))]
+              (backend/select op (:codec args) policy plat)
+              (when (:require-pixel-backend? policy)
+                (backend/select (if (= op :encode) :encode-pixels :decode-pixels)
+                                (:codec args) policy plat)))))))
     graph))
+
+(defn node-gas
+  "1 node の gas。`per-frame?` の op は `frames` を掛け、codec op はさらに
+  選ばれた backend の実測倍率（`backend/gas-scale`）を掛ける。
+
+  倍率を掛けるのが本質的な変更である —— `gas-cost` の `:encode 1500` は
+  「純 cljc で 1 フレーム encode する」コストの単位であり、hardware backend が
+  走るなら同じ node の実コストは 3 桁小さい。倍率を無視した見積りは、
+  どちらが走るかによって 1000 倍外れる。"
+  [{:keys [op args]} frames policy]
+  (let [base (get gas-cost op 0)
+        n (if (contains? per-frame? op) (max 1 frames) 1)
+        ;; 倍率は**画素 backend** のもの。façade op（opaque）は画素を触らないので
+        ;; 倍率の対象ではない —— :require-pixel-backend? が立っているときだけ、
+        ;; この graph の codec node が実画素処理だと分かるので倍率を掛ける。
+        scale (if (and (:require-pixel-backend? policy) (contains? backend/facade-ops op))
+                (backend/gas-scale
+                  (backend/select (if (= op :encode) :encode-pixels :decode-pixels)
+                                  (:codec args) policy
+                                  (or (:platform policy) (backend/platform))))
+                1.0)
+        ;; ceil を interop で書くと cljs が死ぬ（この ns は browser でも動く）
+        x (* base n scale)
+        f #?(:clj (long x) :cljs (js/Math.floor x))]
+    (if (== f x) (long f) (long (inc f)))))
+
+(defn graph-gas
+  "graph 全体の gas 見積り（`frames` フレームを流したときの総和）。
+  `:gas-limit` を超えるなら ex-info を投げる —— 実行して fuel を尽かすのではなく、
+  組んだ時点で拒否する。"
+  [graph policy frames]
+  (let [total (reduce + 0 (map #(node-gas % frames policy) (:nodes graph)))
+        limit (:gas-limit policy)]
+    (when (and limit (> total limit))
+      (throw (ex-info (str "gas 見積り " total " が上限 " limit " を超える")
+                      {:kind :gas-limit-exceeded :estimate total :limit limit
+                       :frames frames})))
+    total))

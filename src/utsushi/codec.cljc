@@ -29,7 +29,8 @@
   直接、RTP payload等）で、utsushi の filtergraph は現状 :demux op が
   ISOBMFFしか受け付けないためそのような入力経路自体が無い（新規追加は
   この follow-up のスコープ外 — 新機能であって『配線』ではない）。"
-  (:require [isobmff.blob :as blob]
+  (:require [utsushi.backend :as backend]
+            [isobmff.blob :as blob]
             [isobmff.box :as box]
             [isobmff.bytes :as by]
             [h264.rbsp :as rbsp]
@@ -125,9 +126,18 @@
   "native decode 境界。R1: bytes は opaque passthrough（:stage を :decoded に
    する）が、codec=:h264 のときだけ avcC 経由の実 SPS 解析（org-iso-h264）で
    各 video track に :params（width/height/profile-idc/level-idc）を付与する
-   — 画素はまだ decode しない、コンテナに埋め込まれた実メタデータの読み取り。"
-  [_policy codec demuxed]
-  (let [demuxed (assoc demuxed :stage :decoded)]
+   — 画素はまだ decode しない、コンテナに埋め込まれた実メタデータの読み取り。
+
+   返り値に `:backend` が付く（`utsushi.backend/select` が選んだ id）。どの実装が
+   走ったかを pipeline が後から見られるようにするためで、hardware 経路と oracle 経路の
+   出力を比べるときにこれが要る。"
+  [policy codec demuxed]
+  ;; policy はこれまで `_policy` で無視されていた。docstring が「実体は
+  ;; capability-gated native host word」と書きながら、どの実装が走るかを決める
+  ;; 場所が空だった —— `utsushi.backend/select` がその場所（ADR-2800002800）。
+  ;; 実行できる backend が無ければここで投げる（理由付き）。
+  (let [chosen (backend/select :decode codec (or policy {}))
+        demuxed (assoc demuxed :stage :decoded :backend (:backend/id chosen))]
     (if (= codec :h264)
       (update demuxed :tracks
               (fn [tracks]
@@ -190,8 +200,9 @@
    avcC 埋め込み :stsd を実合成する（org-iso-h264 の SPS/PPS encode +
    emulation-prevention escape）。パラメータセット層のみ — 画素/フレームは
    まだ encode しない（org-iso-h264 自身のスコープ限定と同じ）。"
-  [_policy codec _opts demuxed]
-  (let [demuxed (assoc demuxed :stage :encoded)]
+  [policy codec _opts demuxed]
+  (let [chosen (backend/select :encode codec (or policy {}))
+        demuxed (assoc demuxed :stage :encoded :backend (:backend/id chosen))]
     (if (= codec :h264)
       (update demuxed :tracks
               (fn [tracks]
