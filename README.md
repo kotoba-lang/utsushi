@@ -34,7 +34,17 @@ TODO stub**だったと判明。H.264/AAC/Opus はそれぞれ独立した外部
 埋める形で新規に [`org-iso-h264`](https://github.com/kotoba-lang/org-iso-h264) /
 [`org-iso-aac`](https://github.com/kotoba-lang/org-iso-aac) /
 [`org-ietf-opus`](https://github.com/kotoba-lang/org-ietf-opus) として実装した
-（`utsushi.bitstream` 自体は削除 — **本repoからの配線は follow-up**）。
+（`utsushi.bitstream` 自体は削除）。
+
+> **2026-08-29 訂正**: ここには長く「**本repoからの配線は follow-up**」と書いて
+> あったが、**それは 2026-07-08 の時点の記述で、その後 stale になっていた**。
+> H.264 の配線は既に在る — `utsushi.pipeline.mp4-h264` が MP4 → demux → avcC →
+> Annex B → 実画素 decode を、`utsushi.pipeline.h264-mp4` が逆方向を、
+> `utsushi.pipeline.remux` が再エンコードなしの trim/concat を持ち、いずれも
+> **実 ffmpeg のゴールデンベクタで bit-exact 検証済み**（下記）。
+> 未配線のまま残っているのは AAC/Opus だけで、その理由は本文最後に書いてある
+> とおり「demux 済み sample には適用対象が無い」という設計判断であって
+> follow-up ではない。
 
 `utsushi` に残るのは: capability/effect/gas モデル（kotoba `policy.rs`/`effects.rs`/
 fuel の鏡写し）、filtergraph データ構築、BSP superstep 実行という **utsushi 固有の
@@ -93,6 +103,62 @@ config記述形式を使い、`isobmff.demux` が返す各 sample は**既に1�
 現状 `:demux` op がISOBMFFしか受け付けないためそのような入力経路自体が無い
 （新規追加はこのfollow-upのスコープ外 — 新機能であって『配線』ではない、
 詳細は `utsushi.codec` のdocstring参照）。
+
+## 複数フレーム decode（GOP: IDR + P-frames、2026-08-29）
+
+`utsushi.pipeline.mp4-h264/decode-h264-frames` は MP4 の **全 sample** を 1 本の
+Annex B ストリーム（avcC の SPS + PPS、続いて各 sample の NAL unit）に組み立てて
+`org-iso-h264` の `h264.decode/decode-gop` に渡し、**GOP 全体の復号フレーム列**を
+返す。各 P-slice は直前の復号ピクチャを単一参照フレームにする。
+
+- pin: `org-iso-h264` を `55ffcdd` → `9bff54f`（default branch tip、34 ahead /
+  0 behind、merge-base == 旧 pin = 純 fast-forward）。`55ffcdd` に `decode-gop` は
+  無く、1 枚目の IDR しか decode できなかった。
+- 単一フレーム経路（`decode-first-h264-frame` → `decode-idr-frame`）はそのまま。
+
+### 実エンコーダ出力に対して decode-gop が受けたもの・拒んだもの
+
+**libx264 に Intra_4x4 を使うなと言う方法は無い。** `--partitions none` は
+`analyse.inter` を 0 にするだけで、x264 自身が印字するパラメータ行は
+`analyse=0x1:0` のまま — この `0x1` が `X264_ANALYSE_I4x4`（実測 2026-08-29、
+ffmpeg 8.1.1 / x264 core 165 r3222）。したがって**ディテールのある内容は必ず
+I_NxN マクロブロックを含み**、`org-iso-h264` はそれを名指しで拒否する:
+
+```
+h264.decode: only Intra_16x16 mb_type (1..24) is supported
+{:mb-type 0 :reason "I_NxN (Intra_4x4/8x8) not implemented"}
+```
+
+境界の両側を fixture として持っている（`test/utsushi/pipeline/mp4_h264_gop_test.clj`）:
+
+| fixture | ffprobe | decode-gop |
+|---|---|---|
+| `mp4-h264-gop32x3.mp4` | I,P,P | **受理** — 3 フレームとも luma+Cb+Cr が実 ffmpeg と bit-exact。P-slice は P_L0_16x16 と CAVLC intra MB の混在 |
+| `mp4-h264-skip32x3.mp4` | I,P,P | **受理** — 同上。P-slice は 100% P_Skip |
+| `mp4-h264-i4x4-reject.mp4` | I,P,P | **拒否** — 上記の I_NxN。理由の literal ごと assert している |
+
+**動きベクトルは全て `[0 0]`。** 平坦な内容だけが Intra_4x4 なしで符号化され、
+平坦な内容には動かすものが無いため、`decode-gop` の sub-pel 動き補償
+（`h264.interp`）は**実エンコーダ出力では一度も実行されていない**。これは実在の
+穴であり、手書きビットストリームで埋めていない（それは decoder を「この repo 自身の
+H.264 観」に対して検査することになる）。
+
+## 再エンコードなし trim / concat（`utsushi.pipeline.remux`、2026-08-29）
+
+`trim`（sample index `[start end)`）と `concat-mp4s` を MP4 bytes → MP4 bytes で
+提供する。コンテナ変換そのものは `org-iso-isobmff`（`isobmff.remux`）に委ね、
+utsushi は orchestration と sample-index 面だけを持つ。
+
+**検証は画素で行い、コンテナのバイト列では行わない。** 同じピクチャを書く 2 つの
+muxer は box 順・`tkhd` の width/height・padding・chunk offset で正当に食い違うので、
+バイト比較は正しさと無関係な理由で落ちる。`remux_test.clj` は utsushi の trim /
+concat 出力を decode して、**実 ffmpeg が自身の `-c copy` 編集を decode した画素**と
+bit-exact 比較する（`ffmpeg -c copy -frames:v 2` / `ffmpeg -f concat -c copy`）。
+逆方向 — 実 ffmpeg が utsushi の書いた MP4 を decode できること — も実測済み
+（trim / concat とも ffmpeg の自前編集と画素一致、2026-08-29）。
+
+IDR を落とす trim は well-formed だが decode できない。`sync-sample-indices` が
+その開始点を答え、`decode-gop` が落ちたときは理由を名指しで返す。
 
 ## R0.5 pixel decode + Datomic decode-state Store（2026-07-12、ADR-2607122000 §4/Migration手順5）
 

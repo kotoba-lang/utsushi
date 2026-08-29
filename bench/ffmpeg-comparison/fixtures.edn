@@ -1,0 +1,24 @@
+;; What to compare, and how far to stretch each fixture per engine.
+;;
+;; The stretch factors are NOT cosmetic. Each engine's per-frame cost is the
+;; SLOPE between a short and a stretched decode, and a slope only resolves a
+;; per-frame cost when the extra frames cost more than the invocation's own
+;; fixed-cost jitter. Those two engines are four orders of magnitude apart in
+;; both quantities, so one shared stretch cannot serve both:
+;;
+;;   - ffmpeg's fixed cost is process startup (measured ~0.5-1.8 s wall on this
+;;     host under load, dominated by dynamic linking, not by decode). Its decode
+;;     of a handful of small flat frames is under a millisecond. At stretch 2 the
+;;     slope came out NEGATIVE — the second invocation happened to start faster.
+;;     ffmpeg therefore needs a stretch in the hundreds before the added decode
+;;     work is visible above that.
+;;   - utsushi's fixed cost is one already-warm JVM method call. Its per-frame
+;;     cost is seconds. A stretch in the hundreds would take the better part of
+;;     an hour per fixture, and buys nothing it does not already resolve.
+;;
+;; Using one stretch for both would mean either an unresolvable ffmpeg number or
+;; an unrunnable utsushi one, and the first of those looks exactly like a
+;; measurement (see this bench's README).
+[{:file "gop32x3.mp4"    :picture "32x32"   :utsushi-stretch 20 :ffmpeg-stretch 200}
+ {:file "gop160x128.mp4" :picture "160x128" :utsushi-stretch 5  :ffmpeg-stretch 100}
+ {:file "gop320x240.mp4" :picture "320x240" :utsushi-stretch 3  :ffmpeg-stretch 40}]

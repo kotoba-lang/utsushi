@@ -24,12 +24,37 @@
 
    ## Scope
 
-   Only the FIRST sample of the FIRST H.264 (`vide`-handler) track is
-   decoded (`decode-frame`/`decode-first-h264-frame` default to
-   `sample-idx` 0) — matching `h264.decode/decode-idr-frame`'s own single-
-   IDR-I-slice-per-call scope (see its docstring). Multi-frame streams,
-   P/B slices, and remux/trim are out of scope here (tracked as follow-up
-   in this repo's ADR)."
+   Two entry points, both real:
+
+   - `decode-first-h264-frame` — ONE sample through
+     `h264.decode/decode-idr-frame` (single IDR I-slice per call).
+   - `decode-h264-frames` — EVERY sample of the track through
+     `h264.decode/decode-gop`, as one Annex B stream (SPS + PPS from
+     avcC, then every sample's NAL units in decode order). Returns the
+     whole decoded frame sequence: IDR followed by P-frames, with
+     `org-iso-h264`'s real single-reference inter prediction.
+
+   ## What a real encoder emits that this cannot yet decode
+
+   `decode-gop`'s macroblock scope is Intra_16x16 (I slices), and
+   P_Skip / P_L0_16x16 / P_16x8 / P_8x16 / P_8x8 plus CAVLC intra
+   macroblocks (P slices). It has no Intra_4x4 (`I_NxN`) path.
+
+   That is not a corner case: **libx264 cannot be told to stop using
+   Intra_4x4.** `--partitions none` zeroes only `analyse.inter`; the
+   printed parameter line still reads `analyse=0x1:0`, where `0x1` is
+   `X264_ANALYSE_I4x4` (measured 2026-08-29, x264 core 165 r3222 via
+   ffmpeg 8.1.1). Any content with detail therefore contains I_NxN
+   macroblocks and is rejected with
+
+     h264.decode: only Intra_16x16 mb_type (1..24) is supported
+     {:mb-type 0 :reason `I_NxN (Intra_4x4/8x8) not implemented`}
+
+   Only fully flat content encodes as 100% Intra_16x16. The fixtures in
+   `resources/utsushi/fixtures/` cover BOTH sides of that line — see
+   `test/utsushi/pipeline/mp4_h264_gop_test.clj`, which asserts the
+   decode for the ones inside it and the exact rejection for the one
+   outside."
   (:require [isobmff.demux :as demux]
             [utsushi.codec :as codec]
             [h264.decode :as h264-decode]))
@@ -133,3 +158,64 @@
     (when-not track
       (throw (ex-info "utsushi.pipeline.mp4-h264: no video (vide) track found in MP4" {})))
     (decode-frame track 0)))
+
+;; ── multi-frame (whole-GOP) decode ───────────────────────────────────────
+
+(defn track->annexb
+  "Build ONE Annex B elementary stream out of a whole demuxed H.264
+   `track`: the avcC parameter sets (every SPS NALU, then every PPS NALU)
+   followed by the NAL units of every sample in `samples` (default: the
+   track's own `:samples`), in decode order, each start-code delimited.
+
+   This is the framing `h264.decode/decode-gop` consumes. It differs from
+   `sample->annexb` only in taking every sample rather than one — but that
+   difference is the whole multi-frame capability, because `decode-gop`
+   finds its pictures by scanning ONE stream for slice NALs and carries
+   each decoded picture forward as the next P-slice's reference frame.
+
+   `samples` lets a caller decode a sub-range (a trim), which is only
+   decodable when it starts at an IDR — nothing here checks that, because
+   `decode-gop` reports it precisely (a P-slice with no reference frame
+   throws) and re-deriving the answer here would be a second, weaker
+   opinion about the same bitstream."
+  ([track] (track->annexb track (:samples track)))
+  ([track samples]
+   (let [avcc (codec/find-avcc (:stsd track))
+         _ (when-not avcc
+             (throw (ex-info "utsushi.pipeline.mp4-h264: no avcC box in stsd (not an H.264/avc1 track?)"
+                              {:track-id (:track-id track)})))
+         {:keys [length-size sps-nalus pps-nalus]} (codec/avcc-config avcc)
+         _ (when (empty? sps-nalus)
+             (throw (ex-info "utsushi.pipeline.mp4-h264: avcC has no SPS NALU" {:track-id (:track-id track)})))
+         _ (when (empty? pps-nalus)
+             (throw (ex-info "utsushi.pipeline.mp4-h264: avcC has no PPS NALU" {:track-id (:track-id track)})))
+         _ (when (empty? samples)
+             (throw (ex-info "utsushi.pipeline.mp4-h264: no samples to decode (empty sample list)"
+                              {:track-id (:track-id track)})))
+         sample-nalus (mapcat #(avcc-sample->nalus (:bytes %) length-size) samples)]
+     (nalus->annexb (concat sps-nalus pps-nalus sample-nalus)))))
+
+(defn decode-track-frames
+  "Decode EVERY sample of a demuxed H.264 `track` (or just `samples`) into
+   a vector of frame maps, in decode order — each the shape
+   `h264.decode/decode-idr-frame` returns ({:width :height :luma :cb :cr}
+   plus per-macroblock observation keys). Real reconstructed pixels for a
+   whole GOP, not just its first picture."
+  ([track] (h264-decode/decode-gop (track->annexb track)))
+  ([track samples] (h264-decode/decode-gop (track->annexb track samples))))
+
+(defn decode-h264-frames
+  "End-to-end multi-frame entry point: raw MP4 FILE bytes → a vector of
+   decoded frames for the first H.264 (`vide`) track.
+
+   The multi-frame counterpart of `decode-first-h264-frame`: demux the
+   container, take the avcC parameter sets and EVERY sample's NAL units
+   into one Annex B stream, and hand it to `h264.decode/decode-gop`, which
+   decodes the IDR and then each P-frame against the immediately preceding
+   decoded picture."
+  [mp4-bytes]
+  (let [demuxed (demux/demux (vec mp4-bytes))
+        track (video-track demuxed)]
+    (when-not track
+      (throw (ex-info "utsushi.pipeline.mp4-h264: no video (vide) track found in MP4" {})))
+    (decode-track-frames track)))
