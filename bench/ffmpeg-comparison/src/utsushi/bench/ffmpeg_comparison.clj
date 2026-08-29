@@ -149,51 +149,144 @@
   (with-open [in (io/input-stream f)]
     (mapv #(bit-and (int %) 0xff) (.readAllBytes in))))
 
-(defn ffmpeg-decode-to-yuv
-  "ffmpeg's own reconstructed pixels for `mp4-file`, as a yuv420p byte
-  vector. Untimed — this is the ground truth for the equal-result check."
-  [bin mp4-file]
-  (let [out (java.io.File/createTempFile "utsushi-bench-ref" ".yuv")]
-    (try
-      (let [{:keys [exit err]} (sh/sh bin "-y" "-v" "error" "-i" (.getPath mp4-file)
-                                      "-pix_fmt" "yuv420p" "-f" "rawvideo" (.getPath out))]
-        (when-not (zero? exit)
-          (throw (ex-info "ffmpeg reference decode failed" {:exit exit :stderr err})))
-        (read-bytes out))
-      (finally (.delete out)))))
+(defn- file->byte-array ^bytes [^java.io.File f]
+  (with-open [in (io/input-stream f)] (.readAllBytes in)))
 
-(defn time-ffmpeg-decode-ms
-  "Wall milliseconds for one ffmpeg subprocess decoding `mp4-file` to
-  `-f null -` (decode, discard). Includes process startup by construction;
-  the slope removes it."
+(defn decode-to-yuv-file!
+  "ffmpeg's own reconstructed pixels for `mp4-file`, written to `out` as raw
+  yuv420p. Untimed — this is the ground truth for the equal-result check.
+
+  Writes a FILE rather than returning a vector because at the stretches this
+  bench uses (see `fixtures.edn`) ffmpeg's long output is ~100 MB, and the
+  earlier version materialised that as a Clojure vector of boxed Integers.
+  A check that cannot be afforded at the size that matters is a check that
+  gets quietly dropped at that size, which is how the precondition would
+  have stopped covering the arm the numbers actually come from."
+  [bin mp4-file ^java.io.File out]
+  (let [{:keys [exit err]} (sh/sh bin "-y" "-v" "error" "-i" (.getPath mp4-file)
+                                  "-pix_fmt" "yuv420p" "-f" "rawvideo" (.getPath out))]
+    (when-not (zero? exit)
+      (throw (ex-info "ffmpeg reference decode failed" {:exit exit :stderr err})))
+    out))
+
+(defn repetition-of?
+  "Is `f` exactly `n` copies of `pattern`, byte for byte?
+
+  Streamed against a cyclic index into `pattern`, so it costs O(1) memory in
+  the length of `f`. Length is checked first: a file of the wrong size cannot
+  be n copies of anything, and saying so before reading a hundred megabytes
+  is free."
+  [^java.io.File f ^bytes pattern ^long n]
+  (let [plen (alength pattern)
+        expected (* (long plen) n)]
+    (and (pos? plen)
+         (= expected (.length f))
+         (with-open [in (io/input-stream f)]
+           (let [buf (byte-array 65536)]
+             (loop [pos 0]
+               (let [r (.read in buf)]
+                 (if (neg? r)
+                   (= pos expected)
+                   (if (loop [i 0]
+                         (cond (= i r) true
+                               (= (aget buf i) (aget pattern (int (rem (+ pos i) plen)))) (recur (inc i))
+                               :else false))
+                     (recur (+ pos r))
+                     false)))))))))
+
+;; ── what gets timed: CPU, not wall ───────────────────────────────────────
+;;
+;; Measured 2026-08-30 on this host at load1 ~440, decoding the 3-frame
+;; 320x240 fixture:
+;;
+;;   ffmpeg   wall 2.07-2.88 s      CPU (utime+stime) 0.080 s, five runs identical
+;;   utsushi  wall 8.8-18.7 s       CPU 0.539-0.626 s
+;;
+;; Wall time is thirty times CPU time and moves by a factor of two between
+;; consecutive runs. On a machine running this many concurrent agents, a wall
+;; clock measures the scheduler's queue, and the decoder's cost is a small
+;; term inside it. That is not a fixable amount of noise — it is a different
+;; quantity. So the metric is CPU time, for both engines, and wall time is
+;; still reported beside it as the evidence for why.
+;;
+;; This is not a loosened tolerance. `perfgate`'s policy is untouched; what
+;; changed is which quantity is handed to it.
+
+(def ^:private ^java.lang.management.ThreadMXBean thread-mx
+  (java.lang.management.ManagementFactory/getThreadMXBean))
+
+(def ^:private ^com.sun.management.OperatingSystemMXBean os-mx
+  (java.lang.management.ManagementFactory/getOperatingSystemMXBean))
+
+(def bench-line-re
+  #"bench: utime=([0-9.]+)s stime=([0-9.]+)s rtime=([0-9.]+)s")
+
+(defn time-ffmpeg-decode
+  "One ffmpeg subprocess decoding `mp4-file` to `-f null -` (decode, discard).
+
+  `:cpu-ms` is `utime + stime` as ffmpeg's own `-benchmark` reports it, which
+  is a getrusage delta taken around the TRANSCODE loop — process startup,
+  dynamic linking and init are outside it by construction. Measured, that is
+  0.002 s where the whole process burns 0.08 s of CPU and 2.5 s of wall.
+
+  `-threads 1` so the CPU figure is one thread's work and comparable with a
+  single-threaded utsushi decode. It makes ffmpeg's wall time worse and its
+  CPU time honest.
+
+  A missing `bench:` line THROWS. An unreadable measurement must not be able
+  to return the same value as a measurement of zero cost."
   [bin mp4-file]
-  (let [t0 (System/nanoTime)
-        {:keys [exit err]} (sh/sh bin "-v" "error" "-i" (.getPath mp4-file) "-f" "null" "-")
-        t1 (System/nanoTime)]
+  (let [w0 (System/nanoTime)
+        {:keys [exit out err]} (sh/sh bin "-hide_banner" "-loglevel" "info" "-benchmark"
+                                      "-threads" "1" "-i" (.getPath mp4-file) "-f" "null" "-")
+        w1 (System/nanoTime)]
     (when-not (zero? exit)
       (throw (ex-info "ffmpeg timed decode failed" {:exit exit :stderr err})))
-    (/ (- t1 t0) 1e6)))
+    (if-let [[_ u sy r] (re-find bench-line-re (str out err))]
+      {:cpu-ms (* 1000.0 (+ (Double/parseDouble u) (Double/parseDouble sy)))
+       :ffmpeg-rtime-ms (* 1000.0 (Double/parseDouble r))
+       :wall-ms (/ (- w1 w0) 1e6)}
+      (throw (ex-info "ffmpeg -benchmark printed no utime line; its CPU time cannot be read"
+                      {:stdout out :stderr err})))))
 
 ;; ── utsushi ──────────────────────────────────────────────────────────────
 
 (defn utsushi-decode-to-yuv
   "utsushi's decoded pixels in the same flat yuv420p layout ffmpeg writes,
-  so the two are comparable as byte vectors with no adapter in between."
-  [mp4-bytes]
-  (vec (mapcat (fn [f] (concat (:luma f) (:cb f) (:cr f)))
-               (pipeline/decode-h264-frames mp4-bytes))))
+  so the two are comparable as bytes with no adapter in between."
+  ^bytes [mp4-bytes]
+  (byte-array
+   (map unchecked-byte
+        (mapcat (fn [f] (concat (:luma f) (:cb f) (:cr f)))
+                (pipeline/decode-h264-frames mp4-bytes)))))
 
-(defn time-utsushi-decode-ms
-  "Wall milliseconds for one in-process utsushi decode. Excludes JVM startup
-  and is taken after warm-up; the slope removes the remaining fixed cost."
+(defn time-utsushi-decode
+  "One in-process utsushi decode. Excludes JVM startup; taken after warm-up.
+
+  `:cpu-ms` is the DECODING THREAD's CPU time. `:process-cpu-ms` is the whole
+  JVM's over the same interval, and the difference between them is the JIT and
+  GC work done on utsushi's behalf on other threads — measured on the 320x240
+  fixture, the thread figure is about 12% below the process figure.
+
+  The thread figure is the one gated on, because the process figure carries
+  the compiler threads' noise (relative stdev 0.064 against 0.053 on the
+  320x240 slope, and 0.59 against 0.20 on the 32x32 one). That choice
+  UNDERCOUNTS utsushi, which is the slow arm, so every `at least N times
+  slower` statement derived from it stays true. Both are reported so the size
+  of the undercount is a number rather than a hand-wave."
   [mp4-bytes]
-  (let [t0 (System/nanoTime)
+  (let [p0 (.getProcessCpuTime os-mx)
+        c0 (.getCurrentThreadCpuTime thread-mx)
+        w0 (System/nanoTime)
         frames (pipeline/decode-h264-frames mp4-bytes)
-        t1 (System/nanoTime)]
-    ;; touch the result so nothing about it can be elided
+        w1 (System/nanoTime)
+        c1 (.getCurrentThreadCpuTime thread-mx)
+        p1 (.getProcessCpuTime os-mx)]
     (when (zero? (count frames))
       (throw (ex-info "utsushi decoded zero frames" {})))
-    (/ (- t1 t0) 1e6)))
+    {:cpu-ms (/ (- c1 c0) 1e6)
+     :process-cpu-ms (/ (- p1 p0) 1e6)
+     :wall-ms (/ (- w1 w0) 1e6)}))
 
 ;; ── one fixture ──────────────────────────────────────────────────────────
 
@@ -201,15 +294,15 @@
   (count (:samples (pipeline/video-track (isobmff.demux/demux (vec mp4-bytes))))))
 
 (defn- slopes
-  "Per-frame milliseconds, sample by sample, as the slope between the short
-  and the stretched stream. Pairing the i-th sample of each keeps the two
-  arms of one slope adjacent in time, so a load excursion moves both."
-  [short-samples long-samples short-frames long-frames]
+  "Per-frame cost, sample by sample, as the slope between the short and the
+  stretched decode. Pairing the i-th sample of each keeps the two arms of one
+  slope adjacent in time, so a load excursion moves both."
+  [short-samples long-samples short-frames long-frames k]
   (let [dn (- long-frames short-frames)]
     (when-not (pos? dn)
       (throw (ex-info "the stretched stream is not longer than the short one"
                       {:short-frames short-frames :long-frames long-frames})))
-    (mapv (fn [s l] (/ (- l s) (double dn))) short-samples long-samples)))
+    (mapv (fn [s l] (/ (- (k l) (k s)) (double dn))) short-samples long-samples)))
 
 (defn compare-fixture
   "Decode one fixture with both engines, check they agree, then time both.
@@ -221,14 +314,18 @@
 
   utsushi and ffmpeg are compared pixel-for-pixel on the fixture itself and
   on the utsushi-stretched stream. ffmpeg's much longer stretch is NOT
-  decoded by utsushi — at these per-frame costs that would take the better
-  part of an hour per fixture. It is checked a different way that costs
-  nothing: a concatenation of N copies of a self-contained GOP must decode
-  to the short decode repeated N times, and ffmpeg's own long output is
-  asserted to be exactly that. So the chain is
-  `utsushi(short) = ffmpeg(short)` and `ffmpeg(long) = ffmpeg(short) x N`,
-  which is a real check rather than an assumption dressed as one."
-  [{:keys [ffmpeg-bin fixture-file samples utsushi-stretch ffmpeg-stretch]}]
+  decoded by utsushi — at these per-frame costs that would take hours per
+  fixture. It is checked a different way that costs O(1) memory and is still
+  a real check: a concatenation of N copies of a self-contained GOP must
+  decode to the short decode repeated N times, and ffmpeg's own long output
+  is asserted, byte for byte, to be exactly that. So the chain is
+  `utsushi(short) = ffmpeg(short)` and `ffmpeg(long) = ffmpeg(short) x N`.
+
+  The precondition is unchanged from the version that passed it on all three
+  fixtures with zero mismatching pixels. Only how it is executed changed, so
+  that it still runs at a hundred megabytes."
+  [{:keys [ffmpeg-bin fixture-file samples utsushi-stretch ffmpeg-stretch warmups]
+    :or {warmups 5}}]
   (let [mp4 (read-bytes fixture-file)
         short-frames (frame-count mp4)
         u-long-mp4 (remux/concat-mp4s (repeat utsushi-stretch mp4))
@@ -236,22 +333,23 @@
         u-long-frames (frame-count u-long-mp4)
         f-long-frames (frame-count f-long-mp4)
         u-long-file (java.io.File/createTempFile "utsushi-bench-ulong" ".mp4")
-        f-long-file (java.io.File/createTempFile "utsushi-bench-flong" ".mp4")]
+        f-long-file (java.io.File/createTempFile "utsushi-bench-flong" ".mp4")
+        ref-short-yuv (java.io.File/createTempFile "utsushi-bench-refs" ".yuv")
+        ref-ulong-yuv (java.io.File/createTempFile "utsushi-bench-refu" ".yuv")
+        ref-flong-yuv (java.io.File/createTempFile "utsushi-bench-reff" ".yuv")]
     (try
       (write-bytes! u-long-file u-long-mp4)
       (write-bytes! f-long-file f-long-mp4)
-      (let [ref-short (ffmpeg-decode-to-yuv ffmpeg-bin fixture-file)
-            ref-u-long (ffmpeg-decode-to-yuv ffmpeg-bin u-long-file)
-            ref-f-long (ffmpeg-decode-to-yuv ffmpeg-bin f-long-file)
+      (let [ref-short (file->byte-array
+                       (decode-to-yuv-file! ffmpeg-bin fixture-file ref-short-yuv))
+            ref-u-long (file->byte-array
+                        (decode-to-yuv-file! ffmpeg-bin u-long-file ref-ulong-yuv))
+            _ (decode-to-yuv-file! ffmpeg-bin f-long-file ref-flong-yuv)
             got-short (utsushi-decode-to-yuv mp4)
             got-u-long (utsushi-decode-to-yuv u-long-mp4)
-            agree-short? (= ref-short got-short)
-            agree-long? (= ref-u-long got-u-long)
-            ;; the cheap check standing in for decoding ffmpeg's long stream
-            ;; with utsushi: N copies of a self-contained GOP must decode to
-            ;; N copies of its pixels.
-            long-is-repetition? (= (vec (apply concat (repeat ffmpeg-stretch ref-short)))
-                                   ref-f-long)]
+            agree-short? (java.util.Arrays/equals ^bytes ref-short ^bytes got-short)
+            agree-long? (java.util.Arrays/equals ^bytes ref-u-long ^bytes got-u-long)
+            long-is-repetition? (repetition-of? ref-flong-yuv ref-short (long ffmpeg-stretch))]
         (if-not (and agree-short? agree-long? long-is-repetition?)
           {:status :mismatch
            :fixture (.getName fixture-file)
@@ -262,12 +360,19 @@
            :note "engines produced different pixels (or the concatenation is not a repetition); nothing was timed"}
           (let [load-before (host/load1)
                 ;; warm-up sits outside every timed interval, for both engines
-                _ (dotimes [_ 2] (time-utsushi-decode-ms mp4))
-                _ (time-ffmpeg-decode-ms ffmpeg-bin fixture-file)
-                u-short (vec (repeatedly samples #(time-utsushi-decode-ms mp4)))
-                u-long (vec (repeatedly samples #(time-utsushi-decode-ms u-long-mp4)))
-                f-short (vec (repeatedly samples #(time-ffmpeg-decode-ms ffmpeg-bin fixture-file)))
-                f-long (vec (repeatedly samples #(time-ffmpeg-decode-ms ffmpeg-bin f-long-file)))
+                ;; JIT warms the same methods whatever the stream length, so
+                ;; the warm-up loop runs on the SHORT stream and the long arm
+                ;; gets one untimed pass to touch its allocation sizes. Running
+                ;; the full loop on both arms cost five minutes per run and
+                ;; changed nothing measurable.
+                _ (dotimes [_ warmups] (time-utsushi-decode mp4))
+                _ (time-utsushi-decode u-long-mp4)
+                _ (time-ffmpeg-decode ffmpeg-bin fixture-file)
+                _ (time-ffmpeg-decode ffmpeg-bin f-long-file)
+                u-short (vec (repeatedly samples #(time-utsushi-decode mp4)))
+                u-long (vec (repeatedly samples #(time-utsushi-decode u-long-mp4)))
+                f-short (vec (repeatedly samples #(time-ffmpeg-decode ffmpeg-bin fixture-file)))
+                f-long (vec (repeatedly samples #(time-ffmpeg-decode ffmpeg-bin f-long-file)))
                 load-after (host/load1)]
             {:status :compared
              :fixture (.getName fixture-file)
@@ -276,76 +381,155 @@
              :ffmpeg-long-frames f-long-frames
              :utsushi-stretch utsushi-stretch
              :ffmpeg-stretch ffmpeg-stretch
-             :yuv-bytes (count ref-short)
+             :warmups warmups
+             :yuv-bytes (alength ^bytes ref-short)
              :load1-before load-before
              :load1-after load-after
-             :utsushi {:wall-ms-short u-short :wall-ms-long u-long
-                       :per-frame-ms (slopes u-short u-long short-frames u-long-frames)}
-             :ffmpeg {:wall-ms-short f-short :wall-ms-long f-long
-                      :per-frame-ms (slopes f-short f-long short-frames f-long-frames)}})))
+             :utsushi {:samples-short u-short :samples-long u-long
+                       :per-frame-cpu-ms (slopes u-short u-long short-frames u-long-frames :cpu-ms)
+                       :per-frame-process-cpu-ms (slopes u-short u-long short-frames u-long-frames :process-cpu-ms)
+                       :per-frame-wall-ms (slopes u-short u-long short-frames u-long-frames :wall-ms)}
+             :ffmpeg {:samples-short f-short :samples-long f-long
+                      :per-frame-cpu-ms (slopes f-short f-long short-frames f-long-frames :cpu-ms)
+                      :per-frame-wall-ms (slopes f-short f-long short-frames f-long-frames :wall-ms)}})))
       (catch Exception e
         {:status :error :fixture (.getName fixture-file)
          :message (.getMessage e) :data (ex-data e)})
-      (finally (.delete u-long-file) (.delete f-long-file)))))
+      (finally (run! #(.delete ^java.io.File %)
+                     [u-long-file f-long-file ref-short-yuv ref-ulong-yuv ref-flong-yuv])))))
 
 
 ;; ── the gate ─────────────────────────────────────────────────────────────
 
-(defn resolved?
-  "Did this engine's slope resolve a per-frame cost at all?
+(defn resolve-slope
+  "Did this arm's slope resolve a per-frame cost, or only produce arithmetic?
 
-  A non-positive slope means the added frames cost less than the
-  invocation's own jitter — the measurement did not reach the quantity. It
-  is NOT a fast engine, and it must not be divided into anything."
+  A per-frame decode cost is a physical quantity and it is strictly positive.
+  The DIFFERENCE two timings produce has no such constraint: subtract two
+  noisy numbers and the arithmetic will hand back a negative one, and a ratio
+  taken against it is a number whose sign belongs to the noise.
+
+  Measured 2026-08-29, that is exactly what happened. ffmpeg's 320x240 wall
+  slope came out mean +0.085 ms/frame with MEDIAN -0.474 and sd 2.81; the
+  harness tested only whether the mean was positive, it was, and the report
+  printed `41550x`. That number is not a slow result or a fast one — it is
+  the ratio of a real quantity to an invalid one.
+
+  So three conditions, each reported by name, all of which must hold:
+
+  | reason | what it catches |
+  |---|---|
+  | `:physically-impossible-sample` | any sample <= 0 — one is enough, because the method produced a value that cannot exist |
+  | `:median-non-positive` | the bulk of the distribution is not positive, however the mean came out |
+  | `:not-separated-from-zero` | `mean - 2*stderr <= 0`: the positive mean is inside its own sampling error |
+
+  The summary is `perfgate`'s; the standard error is arithmetic over it.
+  `:resolved? false` is what STOPS a ratio being derived at all — the harness
+  refuses to print one, rather than printing it with a caveat attached."
   [samples]
-  (pos? (/ (reduce + 0.0 samples) (max 1 (count samples)))))
+  (let [{:keys [n mean stdev median] :as sm} (g/summarize samples)
+        stderr (if (pos? n) (/ stdev (Math/sqrt (double n))) ##Inf)
+        non-positive (count (filter #(<= (double %) 0.0) samples))]
+    {:resolved?
+     (and (zero? non-positive) (pos? median) (> mean (* 2.0 stderr)))
+     :summary sm
+     :stderr stderr
+     :non-positive-samples non-positive
+     :reasons
+     (cond-> []
+       (pos? non-positive)
+       (conj {:reason :physically-impossible-sample
+              :non-positive-samples non-positive :n n :min (:min sm)
+              :note "a per-frame decode cost at or below zero is not a slow result, it is an invalid one"})
+       (not (pos? median))
+       (conj {:reason :median-non-positive :median median :mean mean
+              :note "the bulk of the differenced samples is not positive"})
+       (<= mean (* 2.0 stderr))
+       (conj {:reason :not-separated-from-zero :mean mean :stderr stderr
+              :note "the positive mean is inside its own sampling error"}))}))
+
+(defn ratio-envelope
+  "The range the OBSERVED samples themselves permit for utsushi / ffmpeg.
+
+  `[min_utsushi / max_ffmpeg , max_utsushi / min_ffmpeg]`. It assumes nothing
+  about the noise — not normality, not stationarity, not independence — which
+  is what makes it sayable on a host whose one-minute load moves by tens
+  between samples. It is wider than a standard-error interval, and that width
+  is the honest part.
+
+  This is the statement this bench can actually make when `perfgate` refuses
+  to seal a claim: an order of magnitude that is real is worth more than a
+  ratio that is not. Defined only when both arms resolved a strictly positive
+  slope."
+  [us fs]
+  (when (and (pos? (:min fs)) (pos? (:min us)))
+    (let [low (/ (:min us) (:max fs))
+          high (/ (:max us) (:min fs))]
+      {:low low :high high
+       :point (/ (:mean us) (:mean fs))
+       :decades-low (Math/log10 low)
+       :decades-high (Math/log10 high)})))
 
 (defn qualify-fixture
   "Hand both arms to `perfgate` and keep whatever it says.
 
-  Asked in BOTH directions on purpose. `utsushi as candidate` is the
-  question anyone actually wants answered and is expected to be refused —
-  pure cljc on the JVM against hand-written C with SIMD is not a close
-  race. `ffmpeg as candidate` is the control: a gate that only ever refuses
-  is indistinguishable from a gate that is broken, so the report has to show
-  what it does when handed a real difference."
+  Asked in BOTH directions on purpose. `utsushi as candidate` is the question
+  anyone actually wants answered and is expected to be refused — pure Clojure
+  on the JVM against hand-written C with SIMD is not a close race.
+  `ffmpeg as candidate` is the control: a gate that only ever refuses is
+  indistinguishable from a gate that is broken, so the report has to show what
+  it does when handed a real difference. When that direction qualifies the
+  result is SEALED with `perfgate.core/claim`, which is the only artifact this
+  bench is entitled to produce."
   [result machine]
   (let [obs (fn [id engine long-frames stretch]
               (g/observation
                {:id id
                 :plan-id (keyword (str/replace (:fixture result) #"\.mp4$" ""))
                 :machine machine
-                :metric :steady-state-decode-ms-per-frame
+                :metric :steady-state-decode-cpu-ms-per-frame
                 :unit :ms
                 :lower-is-better? true
-                :samples (get-in result [engine :per-frame-ms])
-                :source (str "slope between " (:short-frames result) "- and "
+                :samples (get-in result [engine :per-frame-cpu-ms])
+                :source (str "CPU-time slope between " (:short-frames result) "- and "
                              long-frames "-frame decodes (stream-copy concat x"
                              stretch ") of " (:fixture result) "; "
                              (case engine
-                               :utsushi "in-process utsushi.pipeline.mp4-h264/decode-h264-frames, post-warm-up"
-                               :ffmpeg "ffmpeg -v error -i FIXTURE -f null - subprocess wall time")
+                               :utsushi (str "in-process utsushi.pipeline.mp4-h264/decode-h264-frames after "
+                                             (:warmups result) " warm-up decodes per arm; ThreadMXBean "
+                                             "getCurrentThreadCpuTime on the decoding thread")
+                               :ffmpeg (str "ffmpeg -benchmark -threads 1 -i FIXTURE -f null - subprocess; "
+                                            "utime+stime as ffmpeg's own getrusage delta around the "
+                                            "transcode loop, which excludes process startup"))
                              "; load1 before=" (:load1-before result)
                              " after=" (:load1-after result))}))
         u (obs :utsushi/steady-state :utsushi
                (:utsushi-long-frames result) (:utsushi-stretch result))
         f (obs :ffmpeg/steady-state :ffmpeg
                (:ffmpeg-long-frames result) (:ffmpeg-stretch result))
-        um (get-in u [:observation/summary :mean])
-        fm (get-in f [:observation/summary :mean])
-        both-resolved? (and (resolved? (get-in result [:utsushi :per-frame-ms]))
-                            (resolved? (get-in result [:ffmpeg :per-frame-ms])))]
+        us (:observation/summary u)
+        fs (:observation/summary f)
+        u-res (resolve-slope (get-in result [:utsushi :per-frame-cpu-ms]))
+        f-res (resolve-slope (get-in result [:ffmpeg :per-frame-cpu-ms]))
+        both? (and (:resolved? u-res) (:resolved? f-res))
+        ffmpeg-verdict (g/qualify f u)]
     {:utsushi-observation u
      :ffmpeg-observation f
+     :utsushi-resolution u-res
+     :ffmpeg-resolution f-res
      :utsushi-as-candidate (g/qualify u f)
-     :ffmpeg-as-candidate (g/qualify f u)
+     :ffmpeg-as-candidate ffmpeg-verdict
+     :claim (when (:qualified? ffmpeg-verdict) (g/claim ffmpeg-verdict f u))
      :minimum-detectable (g/minimum-detectable-improvement f u)
-     :resolution (cond
-                   both-resolved? :resolved
-                   (not (resolved? (get-in result [:ffmpeg :per-frame-ms])))
-                   :ffmpeg-unresolved-below-fixed-cost
-                   :else :utsushi-unresolved-below-fixed-cost)
-     :slowdown-factor (when both-resolved? (/ um fm))}))
+     :wall-noise {:utsushi (g/summarize (get-in result [:utsushi :per-frame-wall-ms]))
+                  :ffmpeg (g/summarize (get-in result [:ffmpeg :per-frame-wall-ms]))}
+     :utsushi-process-cpu (g/summarize (get-in result [:utsushi :per-frame-process-cpu-ms]))
+     :resolution (cond both? :resolved
+                       (and (not (:resolved? u-res)) (not (:resolved? f-res))) :neither-arm-resolved
+                       (not (:resolved? f-res)) :ffmpeg-unresolved
+                       :else :utsushi-unresolved)
+     :ratio-envelope (when both? (ratio-envelope us fs))
+     :slowdown-factor (when both? (/ (:mean us) (:mean fs)))}))
 
 ;; ── report ───────────────────────────────────────────────────────────────
 
@@ -379,6 +563,17 @@
                        :else (str (when (:note r) (str ": " (:note r)))))))
               (:reasons verdict))))
 
+(defn- resolution-lines [label res]
+  (into [(str label " " (if (:resolved? res) "RESOLVED" "NOT RESOLVED")
+               "  mean " (fmt (get-in res [:summary :mean]))
+               " sd " (fmt (get-in res [:summary :stdev]))
+               " median " (fmt (get-in res [:summary :median]))
+               " stderr " (fmt (:stderr res))
+               " non-positive samples " (:non-positive-samples res))]
+        (mapv (fn [r] (str label "   - " (name (:reason r))
+                          (when (:note r) (str ": " (:note r)))))
+              (:reasons res))))
+
 (defn render-lines [report]
   (let [{:keys [host-summary ffmpeg evidence results verdicts]} report]
     (concat
@@ -390,6 +585,9 @@
            "  clusters " (pr-str (:clusters host-summary)))
       (str "host probe        " (:source host-summary))
       (str "ffmpeg            " (or (:version ffmpeg) (:reason ffmpeg)))
+      (str "metric            steady-state decode CPU ms/frame (slope). "
+           "Wall time on this host is ~30x CPU time and moves 2x between runs; "
+           "it is reported but not gated on.")
       (str "workload          flat Intra_16x16 / P_Skip / P_L0_16x16 baseline H.264 "
            "— the only real libx264 output org-iso-h264 decodes. NOT general video.")
       ""
@@ -421,7 +619,11 @@
            " | timed samples taken " (:samples-taken evidence)
            " | samples per arm " (:samples-per-arm evidence)
            " | mismatches " (:mismatches evidence)
-           " | errors " (:errors evidence))
+           " | errors " (:errors evidence)
+           " | arms resolved " (:arms-resolved evidence)
+           " of " (:arms-total evidence)
+           " | perfgate-qualified comparisons " (:qualified-comparisons evidence)
+           " | sealed claims " (:claims-sealed evidence))
       (str "VERDICT   " (name (:verdict report))
            (when (:reason report) (str " (" (name (:reason report)) ")"))
            (when (:note report) (str " — " (:note report))))
@@ -433,7 +635,8 @@
                 (or (:note result) (:message result)))
            ""]
           (let [u (get-in gate [:utsushi-observation :observation/summary])
-                f (get-in gate [:ffmpeg-observation :observation/summary])]
+                f (get-in gate [:ffmpeg-observation :observation/summary])
+                env (:ratio-envelope gate)]
             (concat
              [(str "  " (:fixture result)
                    "   yuv bytes/frame-set " (:yuv-bytes result)
@@ -443,44 +646,55 @@
                    " (concat x" (:utsushi-stretch result) ")"
                    "   ffmpeg " (:short-frames result)
                    "->" (:ffmpeg-long-frames result)
-                   " (concat x" (:ffmpeg-stretch result) ")")
-              (str "    steady-state ms/frame   utsushi mean " (fmt (:mean u))
-                   " sd " (fmt (:stdev u)) " median " (fmt (:median u))
-                   " n " (:n u))
+                   " (concat x" (:ffmpeg-stretch result) ")"
+                   "   warm-ups " (:warmups result))
+              (str "    CPU ms/frame  [METRIC] utsushi mean " (fmt (:mean u))
+                   " sd " (fmt (:stdev u)) " rel-sd " (fmt (:relative-stdev u))
+                   " median " (fmt (:median u)) " n " (:n u))
               (str "                            ffmpeg  mean " (fmt (:mean f))
-                   " sd " (fmt (:stdev f)) " median " (fmt (:median f))
-                   " n " (:n f))
-              (str "    wall ms per invocation  utsushi "
-                   (fmt (:mean (g/summarize (get-in result [:utsushi :wall-ms-short]))))
-                   " (" (:short-frames result) "f) / "
-                   (fmt (:mean (g/summarize (get-in result [:utsushi :wall-ms-long]))))
-                   " (" (:utsushi-long-frames result) "f)")
-              (str "                            ffmpeg  "
-                   (fmt (:mean (g/summarize (get-in result [:ffmpeg :wall-ms-short]))))
-                   " (" (:short-frames result) "f) / "
-                   (fmt (:mean (g/summarize (get-in result [:ffmpeg :wall-ms-long]))))
-                   " (" (:ffmpeg-long-frames result) "f)")
-              (str "    resolution              " (name (:resolution gate)))
-              (str "    utsushi / ffmpeg        "
-                   (if (:slowdown-factor gate)
-                     (str (fmt (:slowdown-factor gate)) "x slower per frame"
-                          "  (UNQUALIFIED ratio — see the gate below)")
-                     "not derived: a slope that did not resolve must not be divided into anything"))
+                   " sd " (fmt (:stdev f)) " rel-sd " (fmt (:relative-stdev f))
+                   " median " (fmt (:median f)) " n " (:n f))
+              (str "    wall ms/frame [not gated] utsushi rel-sd "
+                   (fmt (:relative-stdev (get-in gate [:wall-noise :utsushi])))
+                   "   ffmpeg rel-sd "
+                   (fmt (:relative-stdev (get-in gate [:wall-noise :ffmpeg])))
+                   "   — the noise the CPU metric removes")
+              (str "    utsushi process CPU     mean " (fmt (:mean (:utsushi-process-cpu gate)))
+                   " ms/frame (thread CPU is the metric; the difference is JIT/GC "
+                   "done off-thread, and excluding it undercounts the SLOW arm)")
+              (str "    resolution              " (name (:resolution gate)))]
+             (resolution-lines "    slope[utsushi]" (:utsushi-resolution gate))
+             (resolution-lines "    slope[ffmpeg ]" (:ffmpeg-resolution gate))
+             [(if env
+                (str "    utsushi / ffmpeg        " (fmt (:point env))
+                     "x slower per frame (CPU); distribution-free envelope from the "
+                     "observed samples: " (fmt (:low env)) "x .. " (fmt (:high env)) "x  ("
+                     (format "%.2f" (:decades-low env)) ".."
+                     (format "%.2f" (:decades-high env)) " decades)")
+                (str "    utsushi / ffmpeg        not derived: an unresolved slope "
+                     "must not be divided into anything"))
               (str "    smallest improvement this noise could pass: "
                    (fmt (* 100.0 (:minimum-detectable gate))) "%")]
              (reason-lines "    gate[utsushi as candidate]" (:utsushi-as-candidate gate))
              (reason-lines "    gate[ffmpeg  as candidate]" (:ffmpeg-as-candidate gate))
+             (if-let [c (:claim gate)]
+               [(str "    CLAIM SEALED            " (:claim/plan-id c)
+                     "  improvement " (fmt (* 100.0 (:claim/improvement c))) "%"
+                     "  fingerprint " (:claim/fingerprint c)
+                     "  policy " (:claim/policy-id c))]
+               [])
              [""]))))
       (map (fn [r v] {:result r :gate v}) results verdicts)))))
 
 ;; ── main ─────────────────────────────────────────────────────────────────
 
 (defn- parse-args [args]
-  (loop [a args m {:samples 5 :out nil :skip-kotoba-probe? false}]
+  (loop [a args m {:samples 5 :warmups 5 :out nil :skip-kotoba-probe? false}]
     (if (empty? a)
       m
       (case (first a)
         "--samples" (recur (drop 2 a) (assoc m :samples (Long/parseLong (second a))))
+        "--warmups" (recur (drop 2 a) (assoc m :warmups (Long/parseLong (second a))))
         "--out" (recur (drop 2 a) (assoc m :out (second a)))
         "--skip-kotoba-probe" (recur (rest a) (assoc m :skip-kotoba-probe? true))
         (recur (rest a) m)))))
@@ -539,8 +753,8 @@
 
 (defn run
   "The whole comparison as data. Pure enough to be called from a test."
-  [{:keys [samples skip-kotoba-probe? kotoba-timeout-ms]
-    :or {kotoba-timeout-ms 300000}}]
+  [{:keys [samples warmups skip-kotoba-probe? kotoba-timeout-ms]
+    :or {kotoba-timeout-ms 300000 warmups 5}}]
   (let [machine (host/descriptor)
         bin (ffmpeg-binary)
         ff (ffmpeg-provenance bin)
@@ -563,7 +777,9 @@
                          :engines-measurable (count measurable)
                          :fixtures-attempted (count specs) :fixtures-compared 0
                          :samples-taken 0 :samples-per-arm samples
-                         :mismatches 0 :errors 0}
+                         :mismatches 0 :errors 0
+                         :arms-total 0 :arms-resolved 0
+                         :qualified-comparisons 0 :claims-sealed 0}
               :results [] :verdicts []
               :note "ffmpeg is the reference; without it there is no comparison to pass or refuse"})
 
@@ -575,18 +791,29 @@
                          :engines-measurable (count measurable)
                          :fixtures-attempted 0 :fixtures-compared 0
                          :samples-taken 0 :samples-per-arm samples
-                         :mismatches 0 :errors 0}
+                         :mismatches 0 :errors 0
+                         :arms-total 0 :arms-resolved 0
+                         :qualified-comparisons 0 :claims-sealed 0}
               :results [] :verdicts []
               :note (str "no readable fixture named by " fixtures-manifest
                          "; refusing to report a clean run over nothing")})
 
       :else
-      (let [results (mapv #(compare-fixture (assoc % :ffmpeg-bin bin :samples samples)) specs)
+      (let [results (mapv #(compare-fixture (assoc % :ffmpeg-bin bin :samples samples
+                                                    :warmups warmups))
+                          specs)
             verdicts (mapv #(when (= :compared (:status %)) (qualify-fixture % machine)) results)
             compared (count (filter #(= :compared (:status %)) results))
             mismatches (count (filter #(= :mismatch (:status %)) results))
             errors (count (filter #(= :error (:status %)) results))
-            taken (reduce + 0 (map #(if (= :compared (:status %)) (* 4 samples) 0) results))]
+            taken (reduce + 0 (map #(if (= :compared (:status %)) (* 4 samples) 0) results))
+            gates (remove nil? verdicts)
+            arms-total (* 2 (count gates))
+            arms-resolved (reduce + 0 (map (fn [g] (+ (if (get-in g [:utsushi-resolution :resolved?]) 1 0)
+                                                      (if (get-in g [:ffmpeg-resolution :resolved?]) 1 0)))
+                                           gates))
+            qualified (count (filter #(get-in % [:ffmpeg-as-candidate :qualified?]) gates))
+            claims (count (keep :claim gates))]
         (merge base
                {:verdict (cond (pos? mismatches) :mismatch
                                (zero? compared) :refused
@@ -600,13 +827,18 @@
                            :samples-taken taken
                            :samples-per-arm samples
                            :mismatches mismatches
-                           :errors errors}
+                           :errors errors
+                           :arms-total arms-total
+                           :arms-resolved arms-resolved
+                           :qualified-comparisons qualified
+                           :claims-sealed claims}
                 :results results
                 :verdicts verdicts})))))
 
 (defn -main [& args]
-  (let [{:keys [samples out skip-kotoba-probe?]} (parse-args args)
-        report (run {:samples samples :skip-kotoba-probe? skip-kotoba-probe?})]
+  (let [{:keys [samples warmups out skip-kotoba-probe?]} (parse-args args)
+        report (run {:samples samples :warmups warmups
+                     :skip-kotoba-probe? skip-kotoba-probe?})]
     (doseq [l (render-lines report)] (println l))
     (when out
       (io/make-parents out)

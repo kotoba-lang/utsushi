@@ -1,24 +1,60 @@
 ;; What to compare, and how far to stretch each fixture per engine.
 ;;
-;; The stretch factors are NOT cosmetic. Each engine's per-frame cost is the
-;; SLOPE between a short and a stretched decode, and a slope only resolves a
-;; per-frame cost when the extra frames cost more than the invocation's own
-;; fixed-cost jitter. Those two engines are four orders of magnitude apart in
-;; both quantities, so one shared stretch cannot serve both:
+;; The stretch factors are NOT cosmetic and they are NOT guesses. Each engine's
+;; per-frame cost is the SLOPE between a short and a stretched decode, and a
+;; slope resolves a per-frame cost only when the added work is large against
+;; the invocation's own variation. Every number below was chosen by measuring
+;; the relative standard deviation of the resulting slope on this host and
+;; taking the value that measured best, not by reasoning about what ought to
+;; work. Measured 2026-08-30, MacBookPro18,4 / Apple M1 Max, load1 ~370-450:
 ;;
-;;   - ffmpeg's fixed cost is process startup (measured ~0.5-1.8 s wall on this
-;;     host under load, dominated by dynamic linking, not by decode). Its decode
-;;     of a handful of small flat frames is under a millisecond. At stretch 2 the
-;;     slope came out NEGATIVE — the second invocation happened to start faster.
-;;     ffmpeg therefore needs a stretch in the hundreds before the added decode
-;;     work is visible above that.
-;;   - utsushi's fixed cost is one already-warm JVM method call. Its per-frame
-;;     cost is seconds. A stretch in the hundreds would take the better part of
-;;     an hour per fixture, and buys nothing it does not already resolve.
+;;   fixture        engine   stretch   slope rel-stdev   perfgate tolerance 0.10
+;;   gop32x3        ffmpeg      400        0.21                 refused
+;;   gop32x3        ffmpeg     2000        0.065                passes
+;;   gop160x128     ffmpeg      200        0.138                refused
+;;   gop160x128     ffmpeg     1000        0.066                passes
+;;   gop320x240     ffmpeg      100        0.038                passes
+;;   gop320x240     ffmpeg      300        0.038                passes
+;;   gop32x3        utsushi      20        0.196                refused
+;;   gop32x3        utsushi     100        0.176                refused  <- see below
+;;   gop160x128     utsushi       5        0.086                passes, thin margin
+;;   gop160x128     utsushi      10        0.016                passes
+;;   gop320x240     utsushi       3        0.053                passes
 ;;
-;; Using one stretch for both would mean either an unresolvable ffmpeg number or
-;; an unrunnable utsushi one, and the first of those looks exactly like a
-;; measurement (see this bench's README).
-[{:file "gop32x3.mp4"    :picture "32x32"   :utsushi-stretch 20 :ffmpeg-stretch 200}
- {:file "gop160x128.mp4" :picture "160x128" :utsushi-stretch 5  :ffmpeg-stretch 100}
- {:file "gop320x240.mp4" :picture "320x240" :utsushi-stretch 3  :ffmpeg-stretch 40}]
+;; ## Why ffmpeg's stretches are in the hundreds and thousands
+;;
+;; ffmpeg's timed quantity is CPU time (`-benchmark`'s utime+stime, a getrusage
+;; delta around the transcode loop, so process startup is outside it already).
+;; What is left inside the differenced quantity is demux setup, a few
+;; milliseconds, plus ffmpeg's 1 ms print resolution. The stretches above put
+;; 300-500 ms of decode CPU on the long arm, which makes both of those a
+;; fraction of a percent.
+;;
+;; The previous values (200/100/40) were sized against ffmpeg's WALL time,
+;; where the fixed cost is process startup at 0.5-1.8 s with a standard
+;; deviation of the same order. No stretch this bench could build would have
+;; resolved a 10 ms decode out of that, and at 40 the 320x240 slope came out
+;; with a NEGATIVE MEDIAN and a positive mean, which the report then divided
+;; into utsushi's mean and printed as 41550x. That number was not a
+;; measurement. See `resolve-slope`, which now refuses it.
+;;
+;; ## Why utsushi's stretches stay small
+;;
+;; utsushi's fixed cost is one already-warm JVM method call, and its per-frame
+;; cost is tens to hundreds of milliseconds of CPU. A stretch in the hundreds
+;; buys nothing it does not already resolve and costs hours.
+;;
+;; ## gop32x3's utsushi arm does not resolve at ANY stretch tried
+;;
+;; Raising it 5x (20 -> 100, 60 -> 300 frames) moved the relative standard
+;; deviation from 0.196 to 0.176. That is the signature of PROPORTIONAL noise:
+;; at 2.9 ms of CPU per 32x32 frame, JIT and GC variance is a fixed fraction of
+;; the work, so a longer stream scales the noise with the signal. More stretch
+;; cannot fix it and neither can more samples — perfgate's `:too-noisy` test is
+;; on the samples' own relative spread, which does not shrink with n. That arm
+;; is therefore reported as refused, with its number printed and marked. It is
+;; the one place in this bench where the honest answer is that the quantity is
+;; not resolvable here.
+[{:file "gop32x3.mp4"    :picture "32x32"   :utsushi-stretch 20 :ffmpeg-stretch 2000}
+ {:file "gop160x128.mp4" :picture "160x128" :utsushi-stretch 10 :ffmpeg-stretch 1000}
+ {:file "gop320x240.mp4" :picture "320x240" :utsushi-stretch 3  :ffmpeg-stretch 300}]

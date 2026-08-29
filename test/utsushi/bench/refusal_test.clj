@@ -11,6 +11,7 @@
    behind the `:bench` alias, so the refusal logic is checked on every run
    even though the timing is not."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [utsushi.bench.ffmpeg-comparison :as bench]
             [utsushi.bench.engines :as engines]))
@@ -31,13 +32,112 @@
       (is (seq (:reason p)))
       (is (nil? (:version p))))))
 
-(deftest a-slope-that-did-not-resolve-is-not-a-fast-engine
-  (testing "a non-positive mean slope means the added frames cost less than
-            the invocation's own jitter — the measurement did not reach the
-            quantity, and dividing it into anything invents a ratio"
-    (is (false? (bench/resolved? [-0.4 -0.2 0.1])))
-    (is (false? (bench/resolved? [0.0 0.0])))
-    (is (true? (bench/resolved? [7.5 7.7 7.4])))))
+(deftest a-physically-impossible-slope-is-rejected-not-printed
+  (testing "the measured 2026-08-29 failure: ffmpeg's 320x240 wall slope had a
+            POSITIVE MEAN (+0.085) and a NEGATIVE MEDIAN (-0.474) with sd 2.81,
+            the old mean-only test called it resolved, and the report printed
+            41550x. The mean alone cannot catch this."
+    (let [r (bench/resolve-slope [0.085 -0.474 -1.2 3.9 -0.1])]
+      (is (false? (:resolved? r)))
+      (is (contains? (set (map :reason (:reasons r))) :physically-impossible-sample))
+      (is (contains? (set (map :reason (:reasons r))) :median-non-positive))))
+
+  (testing "one impossible sample is enough — a method that produced a value
+            that cannot exist did not measure the quantity"
+    (let [r (bench/resolve-slope [7.5 7.7 7.4 7.6 -0.01])]
+      (is (false? (:resolved? r)))
+      (is (= 1 (:non-positive-samples r)))
+      (is (contains? (set (map :reason (:reasons r))) :physically-impossible-sample))))
+
+  (testing "zero is not a positive cost either"
+    (is (false? (:resolved? (bench/resolve-slope [0.0 0.0 0.0 0.0 0.0])))))
+
+  (testing "a positive mean sitting inside its own sampling error is refused
+            even with every sample positive — the sign is the noise's"
+    (let [r (bench/resolve-slope [0.01 0.9 0.02 1.8 0.03])]
+      (is (false? (:resolved? r)))
+      (is (contains? (set (map :reason (:reasons r))) :not-separated-from-zero))))
+
+  (testing "a real, tight, positive slope resolves and carries no reasons"
+    (let [r (bench/resolve-slope [7.5 7.7 7.4 7.6 7.5])]
+      (is (true? (:resolved? r)))
+      (is (empty? (:reasons r)))
+      (is (zero? (:non-positive-samples r))))))
+
+(deftest an-unresolved-arm-forbids-a-ratio-entirely
+  (testing "the envelope and the point ratio are BOTH withheld when either arm
+            failed to resolve — refused, not printed with a caveat"
+    (let [result {:status :compared :fixture "x.mp4"
+                  :short-frames 3 :utsushi-long-frames 9 :ffmpeg-long-frames 300
+                  :utsushi-stretch 3 :ffmpeg-stretch 100 :warmups 5
+                  :load1-before 400.0 :load1-after 401.0
+                  :utsushi {:per-frame-cpu-ms [177.0 178.0 176.5 177.5 177.2]
+                            :per-frame-process-cpu-ms [201.0 202.0 200.0 201.5 201.2]
+                            :per-frame-wall-ms [1800.0 2900.0 1200.0 2100.0 1500.0]}
+                  ;; the shape that produced 41550x
+                  :ffmpeg {:per-frame-cpu-ms [0.085 -0.474 -1.2 3.9 -0.1]
+                           :per-frame-wall-ms [0.085 -0.474 -1.2 3.9 -0.1]}}
+          machine {:format :kotoba.machine/v1
+                   :machine/id "test" :machine/provenance :measured
+                   :machine/source "test"
+                   :cpu {:arch :arm64 :cores 10}}
+          gate (bench/qualify-fixture result machine)]
+      (is (= :ffmpeg-unresolved (:resolution gate)))
+      (is (nil? (:slowdown-factor gate)))
+      (is (nil? (:ratio-envelope gate)))
+      (let [text (str/join "\n" (bench/render-lines
+                                 {:host-summary {} :ffmpeg {:version "v"}
+                                  :engines [] :verdict :measured
+                                  :evidence {:engines-in-roster 2 :engines-measurable 2
+                                             :fixtures-attempted 1 :fixtures-compared 1
+                                             :samples-taken 20 :samples-per-arm 5
+                                             :mismatches 0 :errors 0
+                                             :arms-total 2 :arms-resolved 1
+                                             :qualified-comparisons 0 :claims-sealed 0}
+                                  :results [result] :verdicts [gate]}))]
+        (is (str/includes? text "not derived"))
+        (is (not (str/includes? text "x slower per frame"))
+            "no ratio may be rendered against an unresolved arm")
+        (is (str/includes? text "arms resolved 1 of 2"))))))
+
+(deftest the-repetition-precondition-still-holds-at-a-hundred-megabytes
+  (testing "the equal-result check that stands in for decoding ffmpeg's long
+            stream with utsushi is streamed, so raising the stretch into the
+            thousands does not quietly drop it"
+    (let [pattern (byte-array (map unchecked-byte [1 2 3 4 5]))
+          f (java.io.File/createTempFile "rep" ".bin")]
+      (try
+        (with-open [o (io/output-stream f)]
+          (dotimes [_ 4] (.write o pattern)))
+        (is (true? (bench/repetition-of? f pattern 4)))
+        (is (false? (bench/repetition-of? f pattern 3)) "wrong length is not a repetition")
+        (is (false? (bench/repetition-of? f pattern 5)))
+        (is (false? (bench/repetition-of? f (byte-array (map unchecked-byte [1 2 3 4 6])) 4))
+            "same length, one byte different, must be caught")
+        (finally (.delete f)))))
+  (testing "the check must span a buffer boundary, not just the first block"
+    (let [pattern (byte-array (map unchecked-byte (range 100)))
+          f (java.io.File/createTempFile "rep" ".bin")]
+      (try
+        (with-open [o (io/output-stream f)]
+          (dotimes [_ 2000] (.write o pattern)))   ; 200 000 bytes > the 65 536 buffer
+        (is (true? (bench/repetition-of? f pattern 2000)))
+        ;; corrupt one byte in the third buffer-full
+        (with-open [raf (java.io.RandomAccessFile. f "rw")]
+          (.seek raf 150000) (.write raf (int 200)))
+        (is (false? (bench/repetition-of? f pattern 2000))
+            "a difference past the first buffer must still be found")
+        (finally (.delete f))))))
+
+(deftest ffmpegs-cpu-time-is-read-from-its-own-benchmark-line
+  (testing "the CPU number comes from ffmpeg's getrusage delta, not from a
+            wall clock this harness took around the process"
+    (let [[_ u s r] (re-find bench/bench-line-re
+                             "bench: utime=1.067s stime=0.253s rtime=25.097s")]
+      (is (= "1.067" u)) (is (= "0.253" s)) (is (= "25.097" r))))
+  (testing "output with no bench line yields no match, which is what makes
+            time-ffmpeg-decode throw rather than report a cost of zero"
+    (is (nil? (re-find bench/bench-line-re "frame= 3 fps=0.0 q=-1.0 Lsize=N/A")))))
 
 (deftest refused-report-renders-as-refused-with-its-zeroes-visible
   (testing "the ffmpeg-unavailable report says REFUSED, names the reason, and
@@ -53,7 +153,9 @@
                   :evidence {:engines-in-roster 1 :engines-measurable 0
                              :fixtures-attempted 3 :fixtures-compared 0
                              :samples-taken 0 :samples-per-arm 5
-                             :mismatches 0 :errors 0}
+                             :mismatches 0 :errors 0
+                             :arms-total 0 :arms-resolved 0
+                             :qualified-comparisons 0 :claims-sealed 0}
                   :results [] :verdicts []
                   :note "ffmpeg is the reference"}
           text (str/join "\n" (bench/render-lines report))]
@@ -77,7 +179,9 @@
                   :evidence {:engines-in-roster (count roster) :engines-measurable 0
                              :fixtures-attempted 0 :fixtures-compared 0
                              :samples-taken 0 :samples-per-arm 5
-                             :mismatches 0 :errors 0}
+                             :mismatches 0 :errors 0
+                             :arms-total 0 :arms-resolved 0
+                             :qualified-comparisons 0 :claims-sealed 0}
                   :results [] :verdicts []}
           text (str/join "\n" (bench/render-lines report))]
       (testing "the roster carries the incumbent AND every kotoba backend"

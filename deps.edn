@@ -46,6 +46,20 @@
           :extra-deps {io.github.kotoba-lang/perfgate
                        {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
           :main-opts ["-m" "utsushi.bench.ffmpeg-comparison"]}
+  ;; Fixture regeneration needs the same extra path but a different -main.
+  ;; It gets its own alias because `-M:bench -m other.ns` does NOT override an
+  ;; alias's `:main-opts` — the extra args are appended as ARGUMENTS to the
+  ;; alias's main, so that invocation silently runs the benchmark instead.
+  ;; The README documented exactly that non-working command until 2026-08-30.
+  :bench-fixtures {:extra-paths ["bench/ffmpeg-comparison/src"]
+                   :main-opts ["-m" "utsushi.bench.generate-fixtures"]}
+  ;; Where the per-frame time goes. Diagnostic only — it times nothing and
+  ;; gates nothing, and it is NOT run inside the comparison, because a
+  ;; profiler attached to a timed interval measures the profiler.
+  :bench-profile {:extra-paths ["bench/ffmpeg-comparison/src"]
+                  :extra-deps {io.github.kotoba-lang/perfgate
+                               {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
+                  :main-opts ["-m" "utsushi.bench.profile"]}
   ;; the bench's REFUSAL logic is on the ordinary test path (its timing is
   ;; not) — a harness that stays silent when it could not measure is the
   ;; failure worth a test on every run.
