@@ -1,0 +1,82 @@
+(ns utsushi.bench.generate-fixtures
+  "Regenerate this bench's H.264 fixtures with a real ffmpeg.
+
+  Run: `clojure -M -m utsushi.bench.generate-fixtures` (needs ffmpeg on
+  PATH). Writes into `bench/ffmpeg-comparison/fixtures/`.
+
+  ## Every encoder option here is load-bearing
+
+  The fixtures have to satisfy two constraints at once, and both of them
+  come from `org-iso-h264`'s decoder scope rather than from taste:
+
+  - **No Intra_4x4 anywhere.** `h264.decode` implements Intra_16x16 only,
+    and libx264 CANNOT be told to stop choosing Intra_4x4 — `--partitions
+    none` zeroes `analyse.inter` and leaves x264's own printed parameter
+    line reading `analyse=0x1:0`, where `0x1` is `X264_ANALYSE_I4x4`.
+    Measured on this host, x264 picked Intra_4x4 for 8.3%-25% of I-frame
+    macroblocks on every non-flat source tried, and for 0% only on flat
+    content. Hence flat sources.
+  - **Real P-frames.** `ip-factor=1.0` stops x264 lowering the I-frame's
+    QP, which is what tipped even flat content into Intra_4x4. `scenecut=0`
+    stops a per-frame luma change from being detected as a scene cut — with
+    it left at the default, `geq=lum='128+N*10'` produced THREE I-frames and
+    the fixture silently stopped being a GOP while still looking like one.
+
+  A luma ramp (`128+N*10`) rather than a constant colour is what makes the
+  P-frames contain P_L0_16x16 macroblocks and CAVLC intra macroblocks
+  instead of being 100% P_Skip. The constant-colour variant is kept as a
+  separate fixture because P_Skip is its own decode path.
+
+  ## What this cannot produce
+
+  Non-zero motion vectors. Flat content is the only content libx264 encodes
+  without Intra_4x4, and flat content has nothing to displace, so
+  `decode-gop`'s sub-pel motion compensation is not exercised by any fixture
+  a real encoder will give us today. That gap is recorded rather than filled
+  with a hand-authored bitstream, which would test the decoder against this
+  repo's own idea of H.264 instead of against an encoder's."
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [clojure.java.shell :as sh]))
+
+(def x264-opts
+  (str/join ":" ["keyint=999" "ref=1" "bframes=0" "cabac=0" "8x8dct=0"
+                 "me=dia" "subme=1" "partitions=none" "ip-factor=1.0"
+                 "scenecut=0"]))
+
+(def fixtures
+  [{:file "gop32x3.mp4" :size "32x32"
+    :source "color=c=black:s=32x32:d=1:r=15,geq=lum='128+N*10':cb=128:cr=128"
+    :qp 26 :note "I + 2 P mixing P_L0_16x16 with CAVLC intra macroblocks"}
+   {:file "gop160x128.mp4" :size "160x128"
+    :source "color=c=black:s=160x128:d=1:r=15,geq=lum='128+N*10':cb=128:cr=128"
+    :qp 26 :note "same, 20x the macroblocks"}
+   {:file "gop320x240.mp4" :size "320x240"
+    :source "color=c=black:s=320x240:d=1:r=15,geq=lum='128+N*10':cb=128:cr=128"
+    :qp 26 :note "same, 75x the macroblocks"}])
+
+(defn- ffmpeg! [args]
+  (let [{:keys [exit out err]} (apply sh/sh "ffmpeg" args)]
+    (when-not (zero? exit)
+      (throw (ex-info "ffmpeg failed" {:exit exit :args args :stderr err})))
+    (str out err)))
+
+(defn -main [& _]
+  (let [dir (io/file "bench/ffmpeg-comparison/fixtures")]
+    (.mkdirs dir)
+    (doseq [{:keys [file size source qp note]} fixtures]
+      (let [out (io/file dir file)
+            log (ffmpeg! ["-y" "-f" "lavfi" "-i" source "-frames:v" "3"
+                          "-c:v" "libx264" "-profile:v" "baseline"
+                          "-x264opts" x264-opts "-qp" (str qp)
+                          "-pix_fmt" "yuv420p" (.getPath out)])
+            i16 (first (filter #(str/includes? % "mb I  I16") (str/split-lines log)))
+            p (first (filter #(str/includes? % "mb P ") (str/split-lines log)))]
+        (println (format "%-18s %-9s %s" file size note))
+        (println "   " (str/trim (or i16 "NO I-frame macroblock stats reported")))
+        (println "   " (str/trim (or p "NO P-frame macroblock stats reported")))
+        ;; The whole point of the encoder settings is this line. If x264 chose
+        ;; any Intra_4x4, the fixture is undecodable and saying so here is
+        ;; cheaper than discovering it as a test failure.
+        (when-not (and i16 (str/includes? i16 "I16..4: 100.0%"))
+          (println "    WARNING: not 100% Intra_16x16 — org-iso-h264 will refuse this fixture"))))))

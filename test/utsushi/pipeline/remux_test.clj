@@ -1,0 +1,98 @@
+(ns utsushi.pipeline.remux-test
+  "Stream-copy trim/concat verified against real ffmpeg — by PIXELS.
+
+   `resources/utsushi/fixtures/remux-trim2.ref.yuv` and
+   `remux-concat6.ref.yuv` are what a real ffmpeg 8.1.1 decoded out of its
+   OWN stream-copy edits of `mp4-h264-gop32x3.mp4`:
+
+     ffmpeg -i mp4-h264-gop32x3.mp4 -c copy -frames:v 2 trim2.mp4
+     ffmpeg -i trim2.mp4 -pix_fmt yuv420p remux-trim2.ref.yuv
+
+     printf \"file gop32x3.mp4\\nfile gop32x3.mp4\\n\" > concat.txt
+     ffmpeg -f concat -safe 0 -i concat.txt -c copy concat6.mp4
+     ffmpeg -i concat6.mp4 -pix_fmt yuv420p remux-concat6.ref.yuv
+
+   Container bytes are deliberately NOT compared. Two muxers that write
+   the same pictures legitimately disagree about box order, tkhd
+   width/height, padding and chunk offsets, so a byte comparison would
+   fail for reasons unrelated to correctness — and, worse, would pass only
+   if this repo reimplemented ffmpeg's box layout, which is not a
+   correctness property of anything.
+
+   The reverse direction — that a real ffmpeg can DECODE the containers
+   this namespace writes, so the mux is real MP4 rather than merely
+   self-consistent — is measured by the benchmark runner
+   (`bench/ffmpeg-comparison/`), which needs ffmpeg present anyway. It is
+   not asserted here, because a test that quietly passes when ffmpeg is
+   absent would report the same value as one that ran and compared."
+  (:require [clojure.test :refer [deftest is testing]]
+            [clojure.java.io :as io]
+            [isobmff.demux :as demux]
+            [utsushi.pipeline.remux :as remux]
+            [utsushi.pipeline.mp4-h264 :as pipeline]))
+
+(defn- rd-bytes [p]
+  (mapv #(bit-and (int %) 0xff)
+        (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+
+(defn- frames->yuv420p
+  "Decoded frames → the same flat planar layout ffmpeg writes with
+   `-pix_fmt yuv420p`, so the comparison is against ffmpeg's file as-is."
+  [frames]
+  (vec (mapcat (fn [f] (concat (:luma f) (:cb f) (:cr f))) frames)))
+
+(def ^:private src (delay (rd-bytes "utsushi/fixtures/mp4-h264-gop32x3.mp4")))
+
+(deftest trim-matches-ffmpeg-stream-copy-pixels
+  (let [trimmed (remux/trim @src 0 2)
+        frames (pipeline/decode-h264-frames trimmed)
+        ref (rd-bytes "utsushi/fixtures/remux-trim2.ref.yuv")]
+    (testing "the trimmed container really is shorter than the source"
+      (is (< (count trimmed) (count @src))))
+    (testing "it holds exactly the two samples asked for"
+      (is (= 2 (count frames))))
+    (testing "and decodes to the SAME pixels ffmpeg -c copy -frames:v 2 does"
+      (is (= ref (frames->yuv420p frames))))
+    (testing "sanity: the reference is two frames of yuv420p, not a truncated read"
+      (is (= (* 2 (+ (* 32 32) (* 16 16) (* 16 16))) (count ref))))))
+
+(deftest concat-matches-ffmpeg-stream-copy-pixels
+  (let [joined (remux/concat-mp4s [@src @src])
+        frames (pipeline/decode-h264-frames joined)
+        ref (rd-bytes "utsushi/fixtures/remux-concat6.ref.yuv")]
+    (testing "six samples out of two three-sample inputs"
+      (is (= 6 (count frames))))
+    (testing "decodes to the SAME pixels ffmpeg -f concat -c copy does"
+      (is (= ref (frames->yuv420p frames))))
+    (testing "the second copy re-starts at its own IDR, so the join point is a
+              real random-access point rather than a P-slice with a stale reference"
+      (is (= [:i :p :p :i :p :p] (mapv :slice-type-class frames))))))
+
+(deftest concat-is-not-a-no-op-on-either-side
+  (testing "a concat that silently dropped one input would still 'match' a
+            reference generated the same wrong way — so assert the length grew"
+    (let [joined (remux/concat-mp4s [@src @src])]
+      (is (> (count joined) (count @src)))
+      (is (= 6 (count (:samples (pipeline/video-track (demux/demux joined))))))))
+  (testing "concat of a single input is the identity on sample count"
+    (is (= 3 (count (:samples (pipeline/video-track
+                              (demux/demux (remux/concat-mp4s [@src])))))))))
+
+(deftest sync-sample-indices-names-the-decodable-trim-starts
+  (let [track (pipeline/video-track (demux/demux @src))]
+    (testing "this GOP has exactly one sync sample, its IDR at index 0"
+      (is (= [0] (remux/sync-sample-indices track))))))
+
+(deftest trim-that-drops-the-idr-is-refused-by-the-decoder-not-silently-wrong
+  (testing "a stream-copy trim starting after the IDR produces a container that
+            is well-formed but undecodable — decode-gop says so rather than
+            returning wrong pixels"
+    (let [headless (remux/trim @src 1 3)]
+      (is (= 2 (count (:samples (pipeline/video-track (demux/demux headless))))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"P-slice requires a previously-decoded reference frame"
+                            (pipeline/decode-h264-frames headless))))))
+
+(deftest trim-range-validation
+  (testing "an inverted range is refused rather than quietly returning nothing"
+    (is (thrown? clojure.lang.ExceptionInfo (remux/trim @src 2 1)))))

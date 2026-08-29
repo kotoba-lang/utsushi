@@ -21,6 +21,14 @@
 ;; utsushi.codec.store の `:db-api` 注入パターン（MemStore ≡ DatomicStore
 ;; contract、actor 系と同型）の手本かつ実体（langchain.db/api）。
 ;;
+;; multi-frame decode（GOP: IDR + P-frames）: org-iso-h264 を 55ffcdd → 9bff54f
+;; （main tip、34 commits ahead / 0 behind、merge-base == 55ffcdd = 純 fast-forward。
+;; `gh api repos/kotoba-lang/org-iso-h264/compare/55ffcdd...9bff54f` で確認）へ更新。
+;; 55ffcdd には `h264.decode/decode-gop` が存在せず、decode できるのは 1 枚目の IDR
+;; だけだった。9bff54f の decode-gop は 1 本の Annex B ストリームから全ピクチャを
+;; 順に decode し、各 P-slice は直前の復号ピクチャを単一参照フレームにする。
+;; 配線は utsushi.pipeline.mp4-h264/decode-h264-frames。
+;;
 ;; h264-mp4 encode pipeline（画素→H.264 encode→MP4 mux、mp4-h264 の逆方向）:
 ;; org-iso-h264 を daccb23 → 55ffcdd（`h264.encode`/`encode-idr-luma-frame`
 ;; namespace そのもの — luma+chroma Intra_16x16 baseline encoder、Wave 5）へ
@@ -28,14 +36,27 @@
 ;; c107b41/2839cf5 で初めて追加された）ため、encode 方向の配線には必須の更新。
 {:paths ["src" "resources"]
  :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
-         io.github.kotoba-lang/org-iso-h264    {:git/sha "55ffcddacd3aafeb530a13bdf1532c261c947b23"}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "9bff54f1f1d7f24f9ff968285a2fc59e376fc9e5"}
          io.github.kotoba-lang/langchain       {:git/sha "0f966d06c93d7fc76b0790fdece4c391dc257eb1"}}
  :aliases
- {:test {:extra-paths ["test"]
+ {;; ffmpeg comparison benchmark — see bench/ffmpeg-comparison/README.md.
+  ;; perfgate owns the statistics and the refusals; nothing here computes a
+  ;; mean and calls it a result.
+  :bench {:extra-paths ["bench/ffmpeg-comparison/src"]
+          :extra-deps {io.github.kotoba-lang/perfgate
+                       {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
+          :main-opts ["-m" "utsushi.bench.ffmpeg-comparison"]}
+  ;; the bench's REFUSAL logic is on the ordinary test path (its timing is
+  ;; not) — a harness that stays silent when it could not measure is the
+  ;; failure worth a test on every run.
+  :test {:extra-paths ["test" "bench/ffmpeg-comparison/src"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      io.github.kotoba-lang/perfgate
+                      {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
          :main-opts ["-m" "cognitect.test-runner"]}
        ;; clj-kondo as a Clojars lib (no Homebrew/system install needed).
        :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
+                     "bench/ffmpeg-comparison/src"
                      "--fail-level" "error"]}}}
