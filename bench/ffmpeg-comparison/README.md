@@ -91,22 +91,35 @@ stopped at `:source-read` with exit 65, `expgolomb.kotoba` passed `check` with
 exit 0 and then stopped at `:compile` — differently per backend (aarch64 exit 70
 `:kotoba/target-rejected`, wasm32 exit 70 `:kotoba/internal-error`).
 
-**Measured again 2026-08-30, that is no longer what amu returns.** Both files now
-fail `check` identically:
+**Re-measured 2026-08-30 against amu `1ac1241` (its current main), the rungs are
+unchanged.** An earlier run of this probe reported both files failing `check`
+with `:kotoba/invalid-data "input could not be read"` and concluded the two rungs
+had become indistinguishable. That reading was wrong: `invalid-data` on a read is
+a *file not found*, not a grammar refusal, and the probe was resolving its source
+paths from the wrong directory. A path error was recorded as a language-level
+rejection — the pessimistic direction, but a mistake either way.
 
 ```
-amu check h264/decode.cljc       -> exit 65 :kotoba/invalid-data "input could not be read"
-amu check h264/expgolomb.kotoba  -> exit 65 :kotoba/invalid-data "input could not be read"
+amu check   h264/decode.cljc      -> exit 65  :kotoba/source-read-failed
+amu check   h264/expgolomb.kotoba -> exit 0   admitted, effects #{}, 4 exports
+amu check   h264/rbsp.kotoba      -> exit 0   admitted, effects #{}, 1 export
+amu compile h264/expgolomb.kotoba --target aarch64 -> exit 70 :kotoba/target-rejected
+amu compile h264/expgolomb.kotoba --target wasm32  -> exit 70 :kotoba/internal-error
 ```
 
-The guest-grammar file that was admitted yesterday is refused today with the same
-code as the file that is not guest grammar at all, so the bench reports both as
-`:source-read` and the two rungs are, at the moment, not distinguishable by this
-probe. That is recorded rather than smoothed over; why amu changed is a question
-for amu, and asserting the older, more flattering ladder would be reporting a
-measurement nobody took today. **The decoder itself still does not reach the
-compiler**: of the H.264 namespaces in `org-iso-h264/src/h264`, only three
-(`expgolomb`, `rbsp`, `sps` — none of them the decoder) have a guest-grammar twin.
+The rungs remain four different distances, and the guest-grammar files still
+clear `check` and stop at `:compile`, differently per backend. **Pass an absolute
+path when probing**, and treat a read error as a probe defect rather than as
+evidence about the language.
+
+Note also that `orgs/kotoba-lang/amu` as checked out by west can be far behind
+its own main — it was 133 commits behind when this was written — so a probe run
+against it measures a different compiler from the one the pin names. Resolve
+`bin/amu` from a checkout you have just synced, and record which SHA answered.
+
+**The decoder itself still does not reach the compiler**: of the H.264 namespaces
+in `org-iso-h264/src/h264`, only three (`expgolomb`, `rbsp`, `sps` — none of them
+the decoder) have a guest-grammar twin.
 
 ## Same observable result, or no comparison
 
