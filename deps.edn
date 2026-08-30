@@ -60,6 +60,15 @@
                   :extra-deps {io.github.kotoba-lang/perfgate
                                {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
                   :main-opts ["-m" "utsushi.bench.profile"]}
+  ;; Where the gap comes from — the same operation in two containers.
+  ;; Diagnostic only: it changes nothing in the decoder, and the
+  ;; primitive-array arms live under bench/ so no production path can reach
+  ;; them. See bench/decode-cost-attribution/README.md.
+  :bench-attribution {:extra-paths ["bench/decode-cost-attribution/src"
+                                    "bench/ffmpeg-comparison/src"]
+                      :extra-deps {io.github.kotoba-lang/perfgate
+                                   {:git/sha "d4417d77c2333047dd4e478675e5ed13e1c6b1b8"}}
+                      :main-opts ["-m" "utsushi.bench.attribution"]}
   ;; the bench's REFUSAL logic is on the ordinary test path (its timing is
   ;; not) — a harness that stays silent when it could not measure is the
   ;; failure worth a test on every run.
@@ -73,4 +82,5 @@
        :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2024.11.14"}}
          :main-opts ["-m" "clj-kondo.main" "--lint" "src" "test"
                      "bench/ffmpeg-comparison/src"
+                     "bench/decode-cost-attribution/src"
                      "--fail-level" "error"]}}}
