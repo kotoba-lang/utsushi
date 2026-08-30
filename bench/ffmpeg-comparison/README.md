@@ -292,6 +292,17 @@ residual addition (43%).
 
 That is the finding, and this task changed nothing on the strength of it.
 
+## Where the gap comes from
+
+This bench sizes the gap; it does not attribute it.
+[`bench/decode-cost-attribution`](../decode-cost-attribution/README.md) does,
+by running the same operation on the same data in two containers and timing
+both arms interleaved. Measured on benjamin the same day: the data
+representation is worth **~2.9x** of the ratio, plane assembly is a pass
+ffmpeg does not perform at all, and no carrier in amu's value model holds one
+frame plane — so moving the arithmetic kernels into a Kotoba guest today would
+move the cheap part.
+
 ## What these numbers are not
 
 - **Not a general video decode ranking.** The fixtures are flat, DC-heavy,

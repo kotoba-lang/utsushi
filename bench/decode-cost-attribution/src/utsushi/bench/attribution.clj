@@ -1,0 +1,636 @@
+(ns utsushi.bench.attribution
+  "How much of utsushi's decode cost is the DATA REPRESENTATION, measured.
+
+  `bench/ffmpeg-comparison` answers *how much slower than ffmpeg* (measured
+  on benjamin: 414x at 320x240). `utsushi.bench.profile` answers *where the
+  samples land* (measured: ~85% of decoder-attributed samples in picture
+  assembly and residual addition, ~78% of leaf samples inside
+  `clojure.lang.*`). Neither answers *why*, and a leaf-sample profile is not
+  an attribution: `clojure.lang.PersistentVector.doAssoc` being the top leaf
+  is consistent with \"persistent vectors are the cost\" AND with \"the
+  algorithm does far too many stores\", which are different findings with
+  different consequences.
+
+  This namespace discriminates between them the cheapest way there is: it
+  runs the SAME operation on the SAME data twice, changing only the
+  container, and times both arms interleaved in one loop.
+
+  ## The two operations are the two hot spots, not proxies for them
+
+  Both are taken from `h264.decode` at the pin this repo depends on:
+
+  | op | source | profile share |
+  |---|---|---|
+  | `:residual-add` | `h264.decode/add-residual-16x16` + `add-residual-8x8` | 43% of decoder-attributed samples |
+  | `:plane-assembly` | the `assemble` closure inside `h264.decode/decode-picture` | 42.3% |
+
+  `:residual-add`'s persistent arm CALLS THE PRODUCTION VARS
+  (`@#'h264.decode/add-residual-16x16`), so no transcription can drift from
+  what actually runs. `:plane-assembly`'s does not, because `assemble` is a
+  local `fn` inside `decode-picture` and has no var — that one arm is a
+  transcription, and it is labelled as one in `:method` so a reader knows
+  which of the two claims rests on a copy.
+
+  ## Diagnostic only — nothing here is wired into the decoder
+
+  ADR: this measures, it does not optimize. The primitive-array arms exist to
+  produce a number and are not called by `utsushi.pipeline` or by
+  `org-iso-h264`. They are deliberately in `bench/`, not `src/`, so there is
+  no path by which a diagnostic reimplementation becomes a second decoder
+  whose pixels nobody checks against the oracle.
+
+  ## Same pixels or no comparison
+
+  Every arm's output is compared element-by-element against the persistent
+  arm's before ANY timing starts, and a disagreement exits `1` with nothing
+  timed. `:plane-assembly` gets a stronger check than that: its input is the
+  real decoded frame sliced back into per-macroblock grids, so a correct
+  assembly must reproduce the decoder's own plane exactly. That check is
+  against `h264.decode`'s output, not against this file's idea of it.
+
+  ## CPU time, interleaved, with the load beside it
+
+  Wall clock on this workspace is the scheduler's queue (`bench/
+  ffmpeg-comparison`'s README measured wall at 30x CPU and moving 2x between
+  consecutive runs). Every sample here is `ThreadMXBean.getCurrentThreadCpuTime`
+  around the arm, the arms alternate inside one loop so a load excursion
+  moves both, and `load1` is read before and after.
+
+  Statistics are `perfgate`'s. This namespace does not compute a mean and
+  call it a result: `perfgate.core/qualify` decides whether the difference
+  may be claimed, and a refusal is printed as the result it is.
+
+  Run: `clojure -M:bench-attribution [--samples N] [--reps N] [--out FILE]`"
+  (:require [clojure.java.io :as io]
+            [clojure.pprint :as pp]
+            [perfgate.core :as g]
+            [utsushi.bench.host :as host]
+            [h264.decode :as decode]
+            [h264.transform :as transform]
+            [utsushi.pipeline.mp4-h264 :as pipeline])
+  (:gen-class))
+
+(def exit-measured 0)
+(def exit-mismatch 1)
+(def exit-could-not-measure 3)
+;; Four values, because there are four outcomes. A measurement perfgate
+;; REFUSED (too noisy, arms inside their own spread) ran and produced
+;; samples; a measurement that could not run produced none. Collapsing those
+;; two onto 3 would make "the host was busy" indistinguishable from "the
+;; fixture is missing", and collapsing the refusal onto 0 would let an
+;; unqualified ratio be quoted as a clean result.
+(def exit-unqualified 4)
+
+(def ^:private ^java.lang.management.ThreadMXBean thread-mx
+  (java.lang.management.ManagementFactory/getThreadMXBean))
+
+;; ── the production functions under test ──────────────────────────────────
+;;
+;; Deref'd vars, not copies. `add-residual-16x16` and `add-residual-8x8` are
+;; `defn-` in `h264.decode`; reaching them through `#'` is the difference
+;; between measuring the decoder and measuring a transcription of it.
+
+(def add-residual-16x16 @#'decode/add-residual-16x16)
+(def add-residual-8x8 @#'decode/add-residual-8x8)
+
+;; ── op 1: residual addition ──────────────────────────────────────────────
+
+(defn- clip8 ^long [^long v] (if (< v 0) 0 (if (> v 255) 255 v)))
+
+(defn residual-add-primitive-16x16
+  "`add-residual-16x16` with the pixel container changed and NOTHING else.
+
+  Same block order (`h264.decode/blk->col-row`), same inverse transform (the
+  production `h264.transform/inverse-4x4`, called identically), same clip,
+  same coverage of all 256 samples. What differs is that the destination is
+  an `int-array` written with `aset` instead of a 16-deep nested persistent
+  vector rebuilt by `assoc-in`, and the predictor is read with `aget`
+  instead of `get-in`.
+
+  Sharing the production `inverse-4x4` between the arms is deliberate and it
+  is CONSERVATIVE: the transform's own persistent-vector cost stays inside
+  BOTH arms, so it cancels, and the measured ratio is a floor on the
+  representation cost rather than an estimate of it. The profile measured
+  `inverse-4x4` + `luma-dc-hadamard` together at 3.4%, so the amount held
+  back this way is small and known.
+
+  Returns a flat 256-element `int-array` in row-major order."
+  ^ints [^ints pred block-coeffs]
+  (let [out (int-array 256)]
+    (dotimes [b 16]
+      (let [[col row] (get decode/blk->col-row b)
+            col (long col) row (long row)
+            residual (transform/inverse-4x4 (nth block-coeffs b))
+            base-y (* row 4)
+            base-x (* col 4)]
+        (dotimes [ry 4]
+          (let [rrow (nth residual ry)
+                oy (+ base-y ry)]
+            (dotimes [rx 4]
+              (let [idx (+ (* oy 16) base-x rx)]
+                (aset out idx
+                      (int (clip8 (+ (long (aget pred idx))
+                                     (long (nth rrow rx))))))))))))
+    out))
+
+(defn residual-add-primitive-8x8
+  "`add-residual-8x8` with the pixel container changed and nothing else.
+  See `residual-add-primitive-16x16`. Returns a flat 64-element `int-array`."
+  ^ints [^ints pred block-coeffs]
+  (let [out (int-array 64)]
+    (dotimes [b 4]
+      (let [[col row] (get decode/chroma-blk->col-row b)
+            col (long col) row (long row)
+            residual (transform/inverse-4x4 (nth block-coeffs b))
+            base-y (* row 4)
+            base-x (* col 4)]
+        (dotimes [ry 4]
+          (let [rrow (nth residual ry)
+                oy (+ base-y ry)]
+            (dotimes [rx 4]
+              (let [idx (+ (* oy 8) base-x rx)]
+                (aset out idx
+                      (int (clip8 (+ (long (aget pred idx))
+                                     (long (nth rrow rx))))))))))))
+    out))
+
+;; ── op 2: plane assembly ─────────────────────────────────────────────────
+
+(defn assemble-persistent
+  "TRANSCRIPTION of the `assemble` closure inside `h264.decode/decode-picture`
+  (org-iso-h264 at this repo's pinned sha, `src/h264/decode.cljc`, the
+  `assemble` let-binding in `decode-picture`).
+
+  This is the one arm in this file that is a copy rather than a call, because
+  `assemble` is a local `fn` with no var to deref. It is verified against the
+  decoder's own output before timing: `recons` here are the real decoded
+  plane sliced back into per-macroblock grids, so this must reproduce that
+  plane exactly, and `-main` refuses to time anything if it does not."
+  [recons mb-width blk-size plane-w plane-h]
+  (reduce
+   (fn [plane addr]
+     (let [mb-x (mod addr mb-width)
+           mb-y (quot addr mb-width)
+           recon (nth recons addr)]
+       (reduce
+        (fn [plane ry]
+          (reduce
+           (fn [plane rx]
+             (assoc plane (+ (* (+ (* mb-y blk-size) ry) plane-w) (* mb-x blk-size) rx)
+                    (get-in recon [ry rx])))
+           plane (range blk-size)))
+        plane (range blk-size))))
+   (vec (repeat (* plane-w plane-h) 0))
+   (range (count recons))))
+
+(defn assemble-primitive
+  "The same scatter into an `int-array` destination, reading each macroblock
+  out of a flat `int-array` instead of a nested persistent vector. Same
+  addressing arithmetic, same traversal order, same number of stores."
+  ;; No primitive type hints on the parameters: Clojure allows those on at
+  ;; most 4 arguments, and this fn takes 5. The longs are coerced in the let
+  ;; instead, which is where the arithmetic actually happens.
+  ^ints [recons mb-width blk-size plane-w plane-h]
+  (let [blk-size (long blk-size) plane-w (long plane-w) plane-h (long plane-h)
+        out (int-array (* plane-w plane-h))
+        n (count recons)]
+    (dotimes [addr n]
+      (let [mb-x (long (mod addr (long mb-width)))
+            mb-y (long (quot addr (long mb-width)))
+            ^ints recon (nth recons addr)]
+        (dotimes [ry blk-size]
+          (let [dst-row (* (+ (* mb-y blk-size) ry) plane-w)
+                src-row (* ry blk-size)
+                dst-base (+ dst-row (* mb-x blk-size))]
+            (dotimes [rx blk-size]
+              (aset out (+ dst-base rx) (aget recon (+ src-row rx))))))))
+    out))
+
+;; ── inputs, taken from a real decode ─────────────────────────────────────
+
+(defn- read-bytes [^java.io.File f]
+  (with-open [in (io/input-stream f)]
+    (mapv #(bit-and (int %) 0xff) (.readAllBytes in))))
+
+(defn- slice-mb
+  "One macroblock's `blk-size`x`blk-size` grid out of a flat decoded plane,
+  as a vector of row vectors — the shape `assemble` consumes."
+  [plane plane-w mb-x mb-y blk-size]
+  (vec (for [ry (range blk-size)]
+         (vec (for [rx (range blk-size)]
+                (nth plane (+ (* (+ (* mb-y blk-size) ry) plane-w)
+                              (* mb-x blk-size) rx))))))) 
+
+(defn- grid->ints ^ints [grid]
+  (int-array (mapcat identity grid)))
+
+(defn- dc-only-block
+  "A DC-only dequantized coefficient block, the shape the bench fixtures
+  actually produce.
+
+  The fixtures are flat, QP-26, Intra_16x16 libx264 output (see
+  `utsushi.bench.generate-fixtures`), so their luma residual blocks are
+  DC-only — which is why `h264.transform/inverse-4x4`'s DC-only fast path is
+  the path that runs, and why the profile put the transforms at 3.4% rather
+  than where a general decoder would put them.
+
+  Deterministic in `(mb, b)` so both arms and every repetition see identical
+  input. The DC values sweep a small signed range so the clip is exercised at
+  the ends of a plane rather than never."
+  [^long mb ^long b]
+  (let [dc (- (mod (+ (* mb 7) (* b 13)) 129) 64)]
+    (into [(* dc 64)] (repeat 15 0))))
+
+(defn prepare-inputs
+  "Everything both arms consume, derived from ONE real decode of the fixture.
+
+  `:recons` / `:recons-ints` are the decoded planes sliced back into
+  per-macroblock grids — real pixel values in real positions, and the input
+  `assemble` is given inside `decode-picture`. `:preds` reuses those same
+  grids as the residual-add predictor: real decoded pixel values in real
+  range, which is what `add-residual-16x16` receives from intra prediction or
+  motion compensation. The coefficient blocks are synthesized (see
+  `dc-only-block`) because they are internal to a macroblock decode and no
+  public entry point returns them; that is the one input here that is not
+  taken off a real decode, and it is DC-only to match the fixture."
+  [frame]
+  (let [{:keys [width height luma cb cr]} frame
+        mb-width (quot width 16)
+        mb-height (quot height 16)
+        num-mb (* mb-width mb-height)
+        cw (quot width 2) ch (quot height 2)
+        grids (fn [plane plane-w blk]
+                (mapv (fn [addr]
+                        (slice-mb plane plane-w (mod addr mb-width) (quot addr mb-width) blk))
+                      (range num-mb)))
+        luma-grids (grids luma width 16)
+        cb-grids (grids cb cw 8)
+        cr-grids (grids cr cw 8)]
+    {:width width :height height :mb-width mb-width :mb-height mb-height
+     :num-mb num-mb :chroma-w cw :chroma-h ch
+     :plane-luma (vec luma)
+     :plane-cb (vec cb)
+     :plane-cr (vec cr)
+     :recons {:luma luma-grids :cb cb-grids :cr cr-grids}
+     :recons-ints {:luma (mapv grid->ints luma-grids)
+                   :cb (mapv grid->ints cb-grids)
+                   :cr (mapv grid->ints cr-grids)}
+     :preds-ints {:luma (mapv grid->ints luma-grids)
+                  :cb (mapv grid->ints cb-grids)
+                  :cr (mapv grid->ints cr-grids)}
+     :coeffs-16 (mapv (fn [mb] (mapv #(dc-only-block mb %) (range 16))) (range num-mb))
+     :coeffs-4 (mapv (fn [mb] (mapv #(dc-only-block (+ mb 991) %) (range 4))) (range num-mb))}))
+
+;; ── the frame-scale work units ───────────────────────────────────────────
+;;
+;; Each unit is ONE FRAME's worth of that operation, so a per-unit time is
+;; directly comparable with the comparison bench's per-frame decode cost and
+;; with the profile's percentages. Anything smaller would have to be scaled
+;; back up by a factor a reader cannot check.
+
+(defn residual-add-persistent-frame
+  "One frame of residual addition through the production vars: every
+  macroblock's luma 16x16 plus both chroma 8x8 components."
+  [{:keys [num-mb recons coeffs-16 coeffs-4]}]
+  (let [luma (:luma recons) cb (:cb recons) cr (:cr recons)]
+    (loop [mb 0 acc 0]
+      (if (= mb num-mb)
+        acc
+        (let [y (add-residual-16x16 (nth luma mb) (nth coeffs-16 mb))
+              u (add-residual-8x8 (nth cb mb) (nth coeffs-4 mb))
+              v (add-residual-8x8 (nth cr mb) (nth coeffs-4 mb))]
+          (recur (inc mb) (+ acc (long (get-in y [0 0]))
+                             (long (get-in u [0 0])) (long (get-in v [0 0])))))))))
+
+(defn residual-add-primitive-frame
+  "The same frame of residual addition with the pixel container changed."
+  [{:keys [num-mb preds-ints coeffs-16 coeffs-4]}]
+  (let [luma (:luma preds-ints) cb (:cb preds-ints) cr (:cr preds-ints)]
+    (loop [mb 0 acc 0]
+      (if (= mb num-mb)
+        acc
+        (let [^ints y (residual-add-primitive-16x16 (nth luma mb) (nth coeffs-16 mb))
+              ^ints u (residual-add-primitive-8x8 (nth cb mb) (nth coeffs-4 mb))
+              ^ints v (residual-add-primitive-8x8 (nth cr mb) (nth coeffs-4 mb))]
+          (recur (inc mb) (+ acc (long (aget y 0)) (long (aget u 0)) (long (aget v 0)))))))))
+
+(defn inverse-transform-frame
+  "One frame's worth of `h264.transform/inverse-4x4` calls, and nothing else.
+
+  This is a COMPONENT measurement, not a comparison arm. `inverse-4x4` is
+  called identically by both residual-add arms — the primitive arm changes
+  the pixel container, not the transform — so its cost sits inside BOTH of
+  their numbers and cancels out of their difference. That makes the
+  residual-add ratio a floor rather than an estimate, and this arm is how
+  much is being held back: subtract it from the primitive arm and what is
+  left is the array container's own cost.
+
+  The call count matches `residual-add-*-frame` exactly: 16 luma blocks per
+  macroblock plus 4 per chroma component, twice."
+  [{:keys [num-mb coeffs-16 coeffs-4]}]
+  (loop [mb 0 acc 0]
+    (if (= mb num-mb)
+      acc
+      (let [c16 (nth coeffs-16 mb)
+            c4 (nth coeffs-4 mb)
+            a (loop [b 0 a 0]
+                (if (= b 16) a
+                    (recur (inc b) (unchecked-add a (long (get-in (transform/inverse-4x4 (nth c16 b)) [0 0]))))))
+            c (loop [b 0 a 0]
+                (if (= b 4) a
+                    (recur (inc b) (unchecked-add a (long (get-in (transform/inverse-4x4 (nth c4 b)) [0 0]))))))]
+        (recur (inc mb) (unchecked-add acc (unchecked-add a (unchecked-add c c))))))))
+
+(defn assembly-persistent-frame
+  [{:keys [recons mb-width width height chroma-w chroma-h]}]
+  [(assemble-persistent (:luma recons) mb-width 16 width height)
+   (assemble-persistent (:cb recons) mb-width 8 chroma-w chroma-h)
+   (assemble-persistent (:cr recons) mb-width 8 chroma-w chroma-h)])
+
+(defn assembly-primitive-frame
+  [{:keys [recons-ints mb-width width height chroma-w chroma-h]}]
+  [(assemble-primitive (:luma recons-ints) mb-width 16 width height)
+   (assemble-primitive (:cb recons-ints) mb-width 8 chroma-w chroma-h)
+   (assemble-primitive (:cr recons-ints) mb-width 8 chroma-w chroma-h)])
+
+;; ── equality, before anything is timed ───────────────────────────────────
+
+(defn- ints=vec? [^ints a b]
+  (and (= (alength a) (count b))
+       (every? true? (map-indexed (fn [i v] (= (aget a (int i)) (long v))) b))))
+
+(defn check-arms
+  "Both arms compute the same pixels, and assembly reproduces the decoder's
+  own plane. Returns `{:ok? bool :checks [...]}` — the checks are named so a
+  failure says WHICH invariant broke, not just that one did."
+  [inputs]
+  (let [{:keys [recons preds-ints coeffs-16 coeffs-4 plane-luma plane-cb plane-cr]} inputs
+        p-y (add-residual-16x16 (nth (:luma recons) 0) (nth coeffs-16 0))
+        a-y (residual-add-primitive-16x16 (nth (:luma preds-ints) 0) (nth coeffs-16 0))
+        p-u (add-residual-8x8 (nth (:cb recons) 0) (nth coeffs-4 0))
+        a-u (residual-add-primitive-8x8 (nth (:cb preds-ints) 0) (nth coeffs-4 0))
+        last-mb (dec (:num-mb inputs))
+        p-yl (add-residual-16x16 (nth (:luma recons) last-mb) (nth coeffs-16 last-mb))
+        a-yl (residual-add-primitive-16x16 (nth (:luma preds-ints) last-mb) (nth coeffs-16 last-mb))
+        [asm-y asm-u asm-v] (assembly-persistent-frame inputs)
+        [^ints pri-y ^ints pri-u ^ints pri-v] (assembly-primitive-frame inputs)
+        checks
+        [{:check :residual-16x16-arms-agree
+          :ok? (ints=vec? a-y (apply concat p-y))}
+         {:check :residual-16x16-arms-agree-last-mb
+          :ok? (ints=vec? a-yl (apply concat p-yl))}
+         {:check :residual-8x8-arms-agree
+          :ok? (ints=vec? a-u (apply concat p-u))}
+         {:check :assembly-transcription-reproduces-decoder-luma
+          :ok? (= (vec asm-y) plane-luma)}
+         {:check :assembly-transcription-reproduces-decoder-cb
+          :ok? (= (vec asm-u) plane-cb)}
+         {:check :assembly-transcription-reproduces-decoder-cr
+          :ok? (= (vec asm-v) plane-cr)}
+         {:check :assembly-arms-agree-luma :ok? (ints=vec? pri-y asm-y)}
+         {:check :assembly-arms-agree-cb :ok? (ints=vec? pri-u asm-u)}
+         {:check :assembly-arms-agree-cr :ok? (ints=vec? pri-v asm-v)}]]
+    {:ok? (every? :ok? checks) :checks checks}))
+
+;; ── timing ───────────────────────────────────────────────────────────────
+
+(defn- cpu-ms-of
+  "Thread CPU milliseconds for `reps` invocations of `f`.
+
+  `f` must return a LONG digest of its own output, folded here into a value
+  the caller consumes, so the JIT cannot delete work whose result is dead.
+  The digest must be O(1): an earlier version folded `(hash (f))`, which on
+  the assembly arm hashes a 76,800-element persistent vector and would have
+  charged the persistent arm for a full extra traversal per repetition that
+  the primitive arm (whose result is an identity-hashed array) never paid.
+  That is the measurement charging one arm for the harness."
+  [f reps]
+  (let [c0 (.getCurrentThreadCpuTime thread-mx)
+        sink (loop [i 0 acc 0]
+               (if (= i reps)
+                 acc
+                 (recur (inc i) (unchecked-add acc (long (f))))))
+        c1 (.getCurrentThreadCpuTime thread-mx)]
+    {:cpu-ms (/ (- c1 c0) 1e6) :sink sink}))
+
+(defn measure
+  "Interleaved samples for a set of named arms.
+
+  One loop, all arms inside it, one sample each per pass — so a load
+  excursion lands on every arm rather than on whichever happened to be
+  running. Each arm carries its own `:reps` (the cheap arms need more
+  repetitions to clear the clock) and its own `:units` (frame-equivalents per
+  invocation), and every sample is divided down to ONE FRAME so the arms are
+  comparable with each other and with the comparison bench's per-frame cost.
+
+  Returns `{arm-name [cpu-ms-per-frame ...]}`."
+  [arms {:keys [samples]}]
+  (let [acc (volatile! (zipmap (keys arms) (repeat [])))]
+    (dotimes [_ samples]
+      (doseq [[nm {:keys [f reps units]}] arms]
+        (let [{:keys [cpu-ms]} (cpu-ms-of f reps)]
+          (vswap! acc update nm conj (/ cpu-ms (double (* reps units)))))))
+    @acc))
+
+(defn- observe [machine id metric samples source]
+  (g/observation {:id id :machine machine :metric metric :unit :ms
+                  :samples samples :source source}))
+
+(defn- fmt [x] (if (number? x) (format "%.4f" (double x)) (str x)))
+
+(defn- pct [x] (format "%.1f%%" (* 100.0 (double x))))
+
+;; ── report ───────────────────────────────────────────────────────────────
+
+(defn- print-pair [nm {:keys [persistent primitive verdict ratio]}]
+  (println)
+  (println (format "-- %s" (name nm)))
+  (doseq [[label o] [["persistent" persistent] ["primitive " primitive]]]
+    (let [sm (:observation/summary o)]
+      (println (format "   %s  mean %s ms/frame  median %s  rel-stdev %s  n %d"
+                       label (fmt (:mean sm)) (fmt (:median sm))
+                       (fmt (:relative-stdev sm)) (:n sm)))))
+  (println (format "   ratio persistent/primitive  %s x" (fmt ratio)))
+  (if (:qualified? verdict)
+    (println (format "   perfgate: QUALIFIED  improvement %s  gap %s > summed-stdev %s"
+                     (pct (:improvement verdict))
+                     (fmt (get-in verdict [:separation :gap]))
+                     (fmt (get-in verdict [:separation :summed-stdev]))))
+    (do (println "   perfgate: REFUSED -- this ratio is NOT a qualified result")
+        (doseq [r (:reasons verdict)]
+          (println (format "     - %s %s" (name (:reason r)) (pr-str (dissoc r :reason))))))))
+
+(defn- noise-check
+  "perfgate's own single-arm tests, applied to a component that has no
+  baseline to be compared against. `qualify` needs a pair; the noise,
+  sample-count and provenance tests do not, and running them here keeps a
+  component measurement from being quoted at a spread the policy would have
+  refused. Returns the reasons, which are empty when it passes."
+  [o]
+  (let [pol g/default-policy
+        sm (:observation/summary o)]
+    (cond-> []
+      (< (:n sm) (:policy/min-samples pol))
+      (conj {:reason :insufficient-samples :n (:n sm) :required (:policy/min-samples pol)})
+      (> (:relative-stdev sm) (:policy/max-relative-stdev pol))
+      (conj {:reason :too-noisy :relative-stdev (:relative-stdev sm)
+             :allowed (:policy/max-relative-stdev pol)})
+      (not (= :measured (:observation/machine-provenance o)))
+      (conj {:reason :provenance-too-weak :provenance (:observation/machine-provenance o)}))))
+
+(defn- print-component [nm o total-mean]
+  (let [sm (:observation/summary o)
+        reasons (noise-check o)]
+    (println)
+    (println (format "-- %s (component; no baseline, so no speed claim)" (name nm)))
+    (println (format "   mean %s ms/frame  median %s  rel-stdev %s  n %d"
+                     (fmt (:mean sm)) (fmt (:median sm)) (fmt (:relative-stdev sm)) (:n sm)))
+    (when (and total-mean (pos? (double total-mean)))
+      (println (format "   share of full decode  %s" (pct (/ (:mean sm) (double total-mean))))))
+    (if (empty? reasons)
+      (println "   perfgate single-arm tests: pass (samples, spread, provenance)")
+      (do (println "   perfgate single-arm tests: REFUSED")
+          (doseq [r reasons]
+            (println (format "     - %s %s" (name (:reason r)) (pr-str (dissoc r :reason)))))))))
+
+(defn -main [& args]
+  (let [opts (loop [a args m {:samples 9 :reps 20 :fixture "gop320x240.mp4"}]
+               (if (empty? a)
+                 m
+                 (case (first a)
+                   "--samples" (recur (drop 2 a) (assoc m :samples (Long/parseLong (second a))))
+                   "--reps" (recur (drop 2 a) (assoc m :reps (Long/parseLong (second a))))
+                   "--fixture" (recur (drop 2 a) (assoc m :fixture (second a)))
+                   "--out" (recur (drop 2 a) (assoc m :out (second a)))
+                   (recur (rest a) m))))
+        f (io/file "bench/ffmpeg-comparison/fixtures" (:fixture opts))]
+    (when-not (.isFile f)
+      (println "no such fixture:" (.getPath f))
+      (println "generate it with: clojure -M:bench-fixtures")
+      (System/exit exit-could-not-measure))
+    (let [machine (host/descriptor)
+          load-before (host/load1)
+          mp4 (read-bytes f)
+          frames (pipeline/decode-h264-frames mp4)
+          n-frames (count frames)]
+      (when (zero? n-frames)
+        (println "decoded zero frames; nothing to attribute")
+        (System/exit exit-could-not-measure))
+      (let [frame (first frames)
+            inputs (prepare-inputs frame)
+            {:keys [ok? checks]} (check-arms inputs)]
+        (println (format "fixture %s   %dx%d   %d macroblocks   %d frames   host %s   load1 before %s"
+                         (.getName f) (:width inputs) (:height inputs) (:num-mb inputs)
+                         n-frames (:machine/id machine) (str load-before)))
+        (println)
+        (println "equality checks (nothing is timed unless all pass):")
+        (doseq [c checks]
+          (println (format "  %-52s %s" (name (:check c)) (if (:ok? c) "ok" "FAILED"))))
+        (when-not ok?
+          (println)
+          (println "REFUSING to time arms that computed different pixels")
+          (System/exit exit-mismatch))
+        (dotimes [_ 3]
+          (residual-add-persistent-frame inputs)
+          (residual-add-primitive-frame inputs)
+          (inverse-transform-frame inputs)
+          (assembly-persistent-frame inputs)
+          (assembly-primitive-frame inputs)
+          (pipeline/decode-h264-frames mp4))
+        (let [reps (:reps opts)
+              arms {[:residual-add :persistent]
+                    {:reps reps :units 1
+                     :f (fn [] (long (residual-add-persistent-frame inputs)))}
+                    [:residual-add :primitive]
+                    {:reps reps :units 1
+                     :f (fn [] (long (residual-add-primitive-frame inputs)))}
+                    ;; O(1) digests -- see `cpu-ms-of`. Four corner samples,
+                    ;; the same four positions in both arms.
+                    [:plane-assembly :persistent]
+                    {:reps reps :units 1
+                     :f (fn [] (let [[y u v] (assembly-persistent-frame inputs)]
+                                 (+ (long (nth y 0)) (long (nth y (dec (count y))))
+                                    (long (nth u 0)) (long (nth v 0)))))}
+                    [:plane-assembly :primitive]
+                    {:reps reps :units 1
+                     :f (fn [] (let [[^ints y ^ints u ^ints v] (assembly-primitive-frame inputs)]
+                                 (+ (long (aget y 0)) (long (aget y (dec (alength y))))
+                                    (long (aget u 0)) (long (aget v 0)))))}
+                    ;; Component shared by BOTH residual-add arms.
+                    [:inverse-transform :shared]
+                    {:reps reps :units 1
+                     :f (fn [] (long (inverse-transform-frame inputs)))}
+                    ;; The whole decode, in the SAME interleaved loop, so every
+                    ;; share below is a ratio of two numbers taken in one run on
+                    ;; one host rather than a number carried across runs. One
+                    ;; invocation decodes the whole fixture, hence :units.
+                    [:full-decode :production]
+                    {:reps 1 :units n-frames
+                     :f (fn [] (long (count (pipeline/decode-h264-frames mp4))))}}
+              raw (measure arms opts)
+              load-after (host/load1)
+              src (fn [op arm r u]
+                    (str "utsushi.bench.attribution " (name op) "/" (name arm) "; "
+                         r " reps x " u " frame(s) per sample, " (:samples opts)
+                         " samples, all arms interleaved in one loop; "
+                         "ThreadMXBean.getCurrentThreadCpuTime; fixture " (.getName f)
+                         "; load1 " load-before " -> " load-after))
+              obs (into {}
+                        (for [[[op arm :as k] {:keys [reps units]}] arms]
+                          [k (observe machine (keyword (str (name op) "-" (name arm)))
+                                      :frame-op-cpu-ms (get raw k) (src op arm reps units))]))
+              total (get obs [:full-decode :production])
+              total-mean (:mean (:observation/summary total))
+              pairs (into {}
+                          (for [op [:residual-add :plane-assembly]]
+                            (let [o-p (get obs [op :persistent])
+                                  o-a (get obs [op :primitive])]
+                              [op {:persistent o-p :primitive o-a
+                                   :ratio (let [b (:mean (:observation/summary o-a))]
+                                            (when (pos? b)
+                                              (/ (:mean (:observation/summary o-p)) b)))
+                                   :verdict (g/qualify o-a o-p)}])))]
+          (doseq [[nm v] pairs] (print-pair nm v))
+          (print-component :inverse-transform (get obs [:inverse-transform :shared]) total-mean)
+          (print-component :full-decode total nil)
+          (println)
+          (println "-- shares of the full decode, all measured in this one run")
+          (doseq [[op v] pairs]
+            (println (format "   %-16s persistent %s of full decode" (name op)
+                             (pct (/ (:mean (:observation/summary (:persistent v)))
+                                     (double total-mean))))))
+          (println)
+          (println (format "load1 after %s   (before %s)" (str load-after) (str load-before)))
+          (let [report {:format :utsushi.bench.attribution/v1
+                        :fixture (.getName f)
+                        :picture [(:width inputs) (:height inputs)]
+                        :macroblocks (:num-mb inputs)
+                        :frames n-frames
+                        :samples (:samples opts) :reps (:reps opts)
+                        :machine (host/summary machine)
+                        :load1 {:before load-before :after load-after}
+                        :checks checks
+                        :arms (into {} (for [[k o] obs]
+                                         [k {:summary (:observation/summary o)
+                                             :samples (:observation/samples o)
+                                             :source (:observation/source o)}]))
+                        :pairs (into {} (for [[k v] pairs]
+                                          [k {:ratio (:ratio v)
+                                              :qualified? (:qualified? (:verdict v))
+                                              :reasons (:reasons (:verdict v))
+                                              :separation (:separation (:verdict v))}]))
+                        :component-noise-checks
+                        {:inverse-transform (noise-check (get obs [:inverse-transform :shared]))
+                         :full-decode (noise-check total)}
+                        :shares-of-full-decode
+                        (into {} (for [[k o] obs
+                                       :when (not= k [:full-decode :production])]
+                                   [k (/ (:mean (:observation/summary o)) (double total-mean))]))}]
+            (when-let [o (:out opts)]
+              (spit o (with-out-str (pp/pprint report)))
+              (println "wrote" o))
+            (System/exit (if (and (every? #(:qualified? (:verdict %)) (vals pairs))
+                                  (empty? (noise-check total))
+                                  (empty? (noise-check (get obs [:inverse-transform :shared]))))
+                           exit-measured
+                           exit-unqualified))))))))
