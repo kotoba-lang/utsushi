@@ -15,7 +15,7 @@
   satisfy or claim. The honest alternative is not to wait for quiet — it is
   to state the load the numbers were taken at and let the reader discount
   them."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.java.shell :as sh]
             [machine.core :as m]))
 

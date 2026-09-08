@@ -33,7 +33,7 @@
 
   Run: `clojure -M:bench-profile [fixture.mp4] [iterations]`"
   #?(:clj (:require [clojure.java.io :as io]
-                    [clojure.string :as str]))
+                    [kotoba.lang.text :as str]))
   #?(:clj (:import [jdk.jfr Recording]
                    [jdk.jfr.consumer RecordingFile RecordedEvent RecordedFrame]))
   #?(:clj (:gen-class)))

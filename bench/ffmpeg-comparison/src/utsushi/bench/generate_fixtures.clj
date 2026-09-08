@@ -36,7 +36,7 @@
   with a hand-authored bitstream, which would test the decoder against this
   repo's own idea of H.264 instead of against an encoder's."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.java.shell :as sh]))
 
 (def x264-opts
