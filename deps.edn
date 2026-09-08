@@ -1,9 +1,4 @@
-;; uts
-        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
-        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
-        ;; this repo silently rides whatever a sibling happens to name.
-        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
-       ushi（映し）— 時間ベースメディア（動画/音声）の純 cljc + EDN ライブラリ。
+;; utsushi（映し）— 時間ベースメディア（動画/音声）の純 cljc + EDN ライブラリ。
 ;; 設計 SSoT: 90-docs/adr/2606272200-utsushi-video-edn-filtergraph.md (ADR-2606272200)
 ;;
 ;; 方針（ADR §0、2026-07-08 改訂 — reverse-domain split）:
@@ -40,7 +35,12 @@
 ;; 更新。daccb23 には `h264.encode` 自体が存在しない（この namespace は
 ;; c107b41/2839cf5 で初めて追加された）ため、encode 方向の配線には必須の更新。
 {:paths ["src" "resources"]
- :deps  {io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
+ :deps  {
+        ;; kotoba.lang.text, not clojure.string. Pinned as an explicit floor:
+        ;; tools.deps takes the NEWEST sha it is shown, so without a floor here
+        ;; this repo silently rides whatever a sibling happens to name.
+        io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
+       io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
          io.github.kotoba-lang/org-iso-h264    {:git/sha "9bff54f1f1d7f24f9ff968285a2fc59e376fc9e5"}
          io.github.kotoba-lang/langchain       {:git/sha "0f966d06c93d7fc76b0790fdece4c391dc257eb1"}}
  :aliases
