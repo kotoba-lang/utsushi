@@ -24,7 +24,7 @@
 
   一致が必要な場面(既存出力の再現)では ffmpeg を使うこと。この ns の用途は
   native 依存を持たない経路を用意することであって、ffmpeg の置換ではない。"
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 ;; JVM interop は .cljc に置けない(org-iso-h264 の `round-nearest` が同じ理由で
 ;; 避けている)。floor / round を移植可能に定義する。

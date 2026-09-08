@@ -43,7 +43,7 @@
   exit 70 `:kotoba/target-rejected`, wasm32 exit 70
   `:kotoba/internal-error`."
   (:require [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [clojure.edn :as edn]
             [clojure.java.shell :as sh]))
 

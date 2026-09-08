@@ -93,7 +93,7 @@
     other's fixed cost.
 
   Run: `clojure -M:bench` (add `--samples N`, `--stretch N`, `--out FILE`)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [clojure.java.io :as io]
             [clojure.edn :as edn]
             [clojure.java.shell :as sh]

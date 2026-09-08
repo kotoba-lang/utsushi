@@ -12,7 +12,7 @@
    even though the timing is not."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [utsushi.bench.ffmpeg-comparison :as bench]
             [utsushi.bench.engines :as engines]))
 
