@@ -1,7 +1,7 @@
 (ns utsushi.bench.generate-fixtures
   "Regenerate this bench's H.264 fixtures with a real ffmpeg.
 
-  Run: `clojure -M -m utsushi.bench.generate-fixtures` (needs ffmpeg on
+  Run: `kbb -M -m utsushi.bench.generate-fixtures` (needs ffmpeg on
   PATH). Writes into `bench/ffmpeg-comparison/fixtures/`.
 
   ## Every encoder option here is load-bearing

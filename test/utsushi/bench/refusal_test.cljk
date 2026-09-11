@@ -7,7 +7,7 @@
    report what a probe that ran would have, and zero must never render as
    clean.
 
-   These are in the ordinary test suite (`clojure -M:test`) rather than
+   These are in the ordinary test suite (`kbb -M:test`) rather than
    behind the `:bench` alias, so the refusal logic is checked on every run
    even though the timing is not."
   (:require [clojure.test :refer [deftest is testing]]

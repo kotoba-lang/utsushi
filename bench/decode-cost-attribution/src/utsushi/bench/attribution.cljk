@@ -60,7 +60,7 @@
   call it a result: `perfgate.core/qualify` decides whether the difference
   may be claimed, and a refusal is printed as the result it is.
 
-  Run: `clojure -M:bench-attribution [--samples N] [--reps N] [--out FILE]`"
+  Run: `kbb -M:bench-attribution [--samples N] [--reps N] [--out FILE]`"
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pp]
             [perfgate.core :as g]
@@ -506,7 +506,7 @@
         f (io/file "bench/ffmpeg-comparison/fixtures" (:fixture opts))]
     (when-not (.isFile f)
       (println "no such fixture:" (.getPath f))
-      (println "generate it with: clojure -M:bench-fixtures")
+      (println "generate it with: kbb -M:bench-fixtures")
       (System/exit exit-could-not-measure))
     (let [machine (host/descriptor)
           load-before (host/load1)

@@ -31,7 +31,7 @@
   different runtime, not a port of this one. Writing that as a reader
   conditional keeps the fact in the source instead of in a reader's memory.
 
-  Run: `clojure -M:bench-profile [fixture.mp4] [iterations]`"
+  Run: `kbb -M:bench-profile [fixture.mp4] [iterations]`"
   #?(:clj (:require [clojure.java.io :as io]
                     [kotoba.lang.text :as str]))
   #?(:clj (:import [jdk.jfr Recording]

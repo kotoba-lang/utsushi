@@ -1,11 +1,11 @@
 # `bench/ffmpeg-comparison` — utsushi against ffmpeg, and against where utsushi is going
 
 ```sh
-clojure -M:bench                        # 5 samples per arm, probes the kotoba toolchain
-clojure -M:bench --samples 9 --warmups 6 --out /tmp/report.edn
-clojure -M:bench --skip-kotoba-probe    # fast; records the kotoba arms as :not-probed
-clojure -M:bench-fixtures               # regenerate the fixtures (needs ffmpeg on PATH)
-clojure -M:bench-profile gop320x240.mp4 120   # where utsushi's per-frame time goes
+kbb -M:bench                        # 5 samples per arm, probes the kotoba toolchain
+kbb -M:bench --samples 9 --warmups 6 --out /tmp/report.edn
+kbb -M:bench --skip-kotoba-probe    # fast; records the kotoba arms as :not-probed
+kbb -M:bench-fixtures               # regenerate the fixtures (needs ffmpeg on PATH)
+kbb -M:bench-profile gop320x240.mp4 120   # where utsushi's per-frame time goes
 ```
 
 Exit codes: **0** measured, **1** engines produced different pixels, **3** could not
@@ -260,7 +260,7 @@ machine being busy.
 
 ## Where utsushi's time actually goes
 
-`clojure -M:bench-profile` (a `.cljc` whose every form is `#?(:clj …)`, because JFR
+`kbb -M:bench-profile` (a `.cljc` whose every form is `#?(:clj …)`, because JFR
 is a JVM facility and the arm it profiles is the JVM incumbent) runs the same decode under a JFR execution-sample
 recording and attributes samples two ways: by leaf frame, and by the deepest frame
 inside `h264.*` / `utsushi.*` / `isobmff.*`. It times nothing and gates nothing,
@@ -323,13 +323,13 @@ move the cheap part.
 ## Regenerating the fixtures
 
 ```sh
-clojure -M:bench-fixtures     # needs ffmpeg on PATH
+kbb -M:bench-fixtures     # needs ffmpeg on PATH
 ```
 
 The encoder settings are load-bearing and are documented in
 `utsushi.bench.generate-fixtures` and in
 `test/utsushi/pipeline/mp4_h264_gop_test.cljk`. (This used to be documented as
-`clojure -M -m utsushi.bench.generate-fixtures`, which does not work: the class
+`kbb -M -m utsushi.bench.generate-fixtures`, which does not work: the class
 path comes from an alias, and `-M:bench -m other.ns` does not override the
 alias's `:main-opts` — the extra args are appended as *arguments* to the alias's
 main, so that invocation silently runs the benchmark instead.)
