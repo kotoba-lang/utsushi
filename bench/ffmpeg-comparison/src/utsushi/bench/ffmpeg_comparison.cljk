@@ -92,7 +92,7 @@
     slope excludes process startup by construction. Neither includes the
     other's fixed cost.
 
-  Run: `clojure -M:bench` (add `--samples N`, `--stretch N`, `--out FILE`)."
+  Run: `kbb -M:bench` (add `--samples N`, `--stretch N`, `--out FILE`)."
   (:require [kotoba.lang.text :as str]
             [clojure.java.io :as io]
             [clojure.edn :as edn]

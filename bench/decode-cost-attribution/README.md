@@ -1,8 +1,8 @@
 # `bench/decode-cost-attribution` — which part of the 497x is the data representation
 
 ```sh
-clojure -M:bench-attribution                        # 9 samples x 20 reps, gop320x240
-clojure -M:bench-attribution --samples 11 --reps 50 --out /tmp/report.edn
+kbb -M:bench-attribution                        # 9 samples x 20 reps, gop320x240
+kbb -M:bench-attribution --samples 11 --reps 50 --out /tmp/report.edn
 ```
 
 Exit codes: **0** measured and every arm qualified, **1** the arms computed
@@ -139,7 +139,7 @@ measures that, and it must not be quoted as if it did.
 
 ## Why the shares here differ from the JFR profile, and which to use
 
-Run the same day on the same host, `clojure -M:bench-profile gop320x240.mp4 60`
+Run the same day on the same host, `kbb -M:bench-profile gop320x240.mp4 60`
 took 981 execution samples (floor 200) and attributed, by deepest decoder
 frame:
 
@@ -166,7 +166,7 @@ not on how much.
 
 ## Anchors measured the same day on the same host
 
-`clojure -M:bench --samples 7 --skip-kotoba-probe` on benjamin, 2026-08-30:
+`kbb -M:bench --samples 7 --skip-kotoba-probe` on benjamin, 2026-08-30:
 
 | fixture | utsushi CPU ms/frame | ffmpeg | ratio | envelope |
 |---|---:|---:|---:|---|

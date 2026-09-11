@@ -68,7 +68,7 @@ ADR §3/§4 を cljc で realize（kotoba `policy.rs`/`effects.rs`/fuel/Pregel �
   （= kotoba graph_def_cid 相当）/ per-frame gas（fuel 相当）/ `transcode` の CID-MV メモ化。
   demux/remux/mux オペレータは `org-iso-isobmff` に委譲。
 
-**検証**: `test/utsushi/pregel_test.cljk`（`clojure -M:test`、6 tests / 16 assertions）が
+**検証**: `test/utsushi/pregel_test.cljk`（`kbb -M:test`、6 tests / 16 assertions）が
 deny-by-default 拒否・under-declaration 拒否(T2)・per-frame gas 会計・gas 上限 trap(fuel)・
 BSP 決定論・同一 input+graph のメモ化を、`org-iso-isobmff` 実物への git 依存越しに確認。
 
@@ -212,7 +212,7 @@ attribute map）をそのまま流用する。
 ## テスト
 
 ```sh
-clojure -M:test
+kbb -M:test
 ```
 
 ## ライセンス
