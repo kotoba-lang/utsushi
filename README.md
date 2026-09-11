@@ -68,7 +68,7 @@ ADR §3/§4 を cljc で realize（kotoba `policy.rs`/`effects.rs`/fuel/Pregel �
   （= kotoba graph_def_cid 相当）/ per-frame gas（fuel 相当）/ `transcode` の CID-MV メモ化。
   demux/remux/mux オペレータは `org-iso-isobmff` に委譲。
 
-**検証**: `test/utsushi/pregel_test.cljc`（`clojure -M:test`、6 tests / 16 assertions）が
+**検証**: `test/utsushi/pregel_test.cljk`（`clojure -M:test`、6 tests / 16 assertions）が
 deny-by-default 拒否・under-declaration 拒否(T2)・per-frame gas 会計・gas 上限 trap(fuel)・
 BSP 決定論・同一 input+graph のメモ化を、`org-iso-isobmff` 実物への git 依存越しに確認。
 
@@ -79,7 +79,7 @@ opaque raw bytes のまま保持している box）から **avcC(AVCDecoderConfi
 ISO/IEC 14496-15)** を読み、埋め込まれた SPS NAL Unit を `org-iso-h264` の
 `h264.rbsp/unescape` + `h264.sps/parse` に通して実際の width/height/profile-idc を
 取得し、各 video track に `:params` として付与する。**実 libx264 エンコード済み
-MP4(96x64, baseline)で検証済み**（`test/utsushi/codec_test.clj`）。
+MP4(96x64, baseline)で検証済み**（`test/utsushi/codec_test.cljk`）。
 
 `utsushi.codec/encode` は decode の鏡像: `codec=:h264` のとき、video track の
 `:params`（decode が生成するのと同じ形 — width/height/profile-idc/level-idc）から
@@ -88,7 +88,7 @@ MP4(96x64, baseline)で検証済み**（`test/utsushi/codec_test.clj`）。
 付与する。**org-iso-h264 自身のスコープ限定（パラメータセット層のみ、
 macroblock/pixel/CAVLC/CABAC は未実装）をそのまま継承** — フレームデータ
 （`:samples`）は合成しない。`encode` → `decode` の round trip でパラメータが
-完全に一致することを確認済み（`test/utsushi/codec_encode_test.cljc`、
+完全に一致することを確認済み（`test/utsushi/codec_encode_test.cljk`、
 `h264-encode-decode-round-trip`）。
 
 **AAC(`org-iso-aac`)/Opus(`org-ietf-opus`)は意図的に未配線**: MP4 の
@@ -129,7 +129,7 @@ h264.decode: only Intra_16x16 mb_type (1..24) is supported
 {:mb-type 0 :reason "I_NxN (Intra_4x4/8x8) not implemented"}
 ```
 
-境界の両側を fixture として持っている（`test/utsushi/pipeline/mp4_h264_gop_test.clj`）:
+境界の両側を fixture として持っている（`test/utsushi/pipeline/mp4_h264_gop_test.cljk`）:
 
 | fixture | ffprobe | decode-gop |
 |---|---|---|
@@ -190,7 +190,7 @@ attribute map）をそのまま流用する。
 - **テスト戦略**: `gftd-talent-actor`の`talent.store-contract-test`（MemStore/
   DatomicStoreの両方に対して同一contractを実行、ただしどちらも`langchain.db`
   ベースでin-process — 実Datomic接続はテストしない）にならい、
-  `test/utsushi/codec_store_test.clj` は `langchain.db/api`（既定の`db-api`）に
+  `test/utsushi/codec_store_test.cljk` は `langchain.db/api`（既定の`db-api`）に
   対する統合テストのみを用意。実際の `org-iso-h264` golden vector
   （`flat16-dc-only.h264`、実libx264エンコード+実ffmpeg decode基準、本repoの
   `resources/utsushi/fixtures/`に複製）を1本decodeし、`:pending`→`:decoded`の
