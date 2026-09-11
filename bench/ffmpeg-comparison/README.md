@@ -328,7 +328,7 @@ clojure -M:bench-fixtures     # needs ffmpeg on PATH
 
 The encoder settings are load-bearing and are documented in
 `utsushi.bench.generate-fixtures` and in
-`test/utsushi/pipeline/mp4_h264_gop_test.clj`. (This used to be documented as
+`test/utsushi/pipeline/mp4_h264_gop_test.cljk`. (This used to be documented as
 `clojure -M -m utsushi.bench.generate-fixtures`, which does not work: the class
 path comes from an alias, and `-M:bench -m other.ns` does not override the
 alias's `:main-opts` — the extra args are appended as *arguments* to the alias's

@@ -18,7 +18,7 @@
    order, `tkhd` width/height, `free` padding and chunk offsets. Comparing
    this namespace's output to `ffmpeg -c copy`'s output byte-for-byte would
    fail for reasons that have nothing to do with correctness. The test
-   (`test/utsushi/pipeline/remux_test.clj`) therefore decodes both and
+   (`test/utsushi/pipeline/remux_test.cljk`) therefore decodes both and
    compares PIXELS, against reference YUV that a real ffmpeg produced from
    its OWN stream-copy edit of the same source.
 

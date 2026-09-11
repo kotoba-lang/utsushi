@@ -52,7 +52,7 @@
 
    Only fully flat content encodes as 100% Intra_16x16. The fixtures in
    `resources/utsushi/fixtures/` cover BOTH sides of that line — see
-   `test/utsushi/pipeline/mp4_h264_gop_test.clj`, which asserts the
+   `test/utsushi/pipeline/mp4_h264_gop_test.cljk`, which asserts the
    decode for the ones inside it and the exact rejection for the one
    outside."
   (:require [isobmff.demux :as demux]
