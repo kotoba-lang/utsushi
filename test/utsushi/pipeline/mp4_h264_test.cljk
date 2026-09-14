@@ -28,11 +28,10 @@
    luma plane only (first width*height bytes of the yuv420p file), no
    tolerance/epsilon."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            [utsushi.test-host :as th]
             [utsushi.pipeline.mp4-h264 :as pipeline]))
 
-(defn- rd-bytes [p]
-  (mapv #(bit-and (int %) 0xff) (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd-bytes [p] (th/resource-bytes p))
 
 (deftest decode-first-h264-frame-real-mp4-golden-vector
   (let [mp4-bytes (rd-bytes "utsushi/fixtures/mp4-h264-flat32.mp4")

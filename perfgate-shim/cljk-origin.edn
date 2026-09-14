@@ -1,0 +1,7 @@
+{:format :kotoba.cljk-origin/v1
+ :renamed-on "2026-09-15"
+ :decision "kbb-local copies of perfgate + machine (gitlibs cache checkouts have no cljk-origin manifest)"
+ :rule "value = the extension the file had before the rename."
+ :origins
+ {"src/machine/core.cljc.cljk" ".cljc"
+  "src/perfgate/core.cljc.cljk" ".cljc"}}

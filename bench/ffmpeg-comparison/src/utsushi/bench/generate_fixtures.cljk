@@ -35,9 +35,15 @@
   a real encoder will give us today. That gap is recorded rather than filled
   with a hand-authored bitstream, which would test the decoder against this
   repo's own idea of H.264 instead of against an encoder's."
-  (:require [clojure.java.io :as io]
-            [kotoba.lang.text :as str]
-            [clojure.java.shell :as sh]))
+  (:require [kotoba.lang.text :as str]))
+
+;; Host boundary: sh via node:child_process, files as strings.
+(defn sh [& cmd]
+  (let [cp (js/require "child_process")
+        r (.spawnSync cp (nth cmd 0) (into-array (rest cmd)) #js {:encoding "utf8"})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(defn exists-file? [p] (and p (.existsSync (js/require "fs") (str p)) (not (.isDirectorySync (js/require "fs") (str p)))))
 
 (def x264-opts
   (str/join ":" ["keyint=999" "ref=1" "bframes=0" "cabac=0" "8x8dct=0"
@@ -56,16 +62,16 @@
     :qp 26 :note "same, 75x the macroblocks"}])
 
 (defn- ffmpeg! [args]
-  (let [{:keys [exit out err]} (apply sh/sh "ffmpeg" args)]
+  (let [{:keys [exit out err]} (apply sh "ffmpeg" args)]
     (when-not (zero? exit)
       (throw (ex-info "ffmpeg failed" {:exit exit :args args :stderr err})))
     (str out err)))
 
 (defn -main [& _]
-  (let [dir (io/file "bench/ffmpeg-comparison/fixtures")]
-    (.mkdirs dir)
+  (let [dir "bench/ffmpeg-comparison/fixtures"]
+    (.mkdirSync (js/require "fs") dir #js {:recursive true})
     (doseq [{:keys [file size source qp note]} fixtures]
-      (let [out (io/file dir file)
+      (let [out (str dir "/" file)
             log (ffmpeg! ["-y" "-f" "lavfi" "-i" source "-frames:v" "3"
                           "-c:v" "libx264" "-profile:v" "baseline"
                           "-x264opts" x264-opts "-qp" (str qp)

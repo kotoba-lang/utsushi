@@ -94,17 +94,43 @@
 
   Run: `kbb -M:bench` (add `--samples N`, `--stretch N`, `--out FILE`)."
   (:require [kotoba.lang.text :as str]
-            [clojure.java.io :as io]
             [clojure.edn :as edn]
-            [clojure.java.shell :as sh]
-            [clojure.pprint :as pp]
             [perfgate.core :as g]
             [utsushi.bench.host :as host]
             [utsushi.bench.engines :as engines]
             [isobmff.demux]
             [utsushi.pipeline.mp4-h264 :as pipeline]
-            [utsushi.pipeline.remux :as remux])
-  (:gen-class))
+            [utsushi.pipeline.remux :as remux]))
+
+;; ── host boundary ────────────────────────────────────────────────────────
+;; Process and filesystem primitives live here and nowhere else; everything
+;; downstream consumes plain data (paths as strings, {:exit :out :err} maps).
+(defn sh [& cmd]
+  (let [cp (js/require "child_process")
+        r (.spawnSync cp (nth cmd 0) (into-array (rest cmd)) #js {:encoding "utf8"})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
+(defn exists-file? [p] (and p (.existsSync (js/require "fs") (str p)) (not (.isDirectorySync (js/require "fs") (str p)))))
+
+(defn- slurp-safe
+  "Reads a file as text, or returns nil when absent — the JVM `slurp` on a
+   checked-first path's absence-tolerant shape."
+  [p] (when (exists-file? p) (str (.readFileSync (js/require "fs") (str p) "utf8"))))
+
+(defn temp-file!
+  "java.io.File/createTempFile-shaped: a fresh absolute path string. Deletes
+  nothing — callers unlink through `delete-file!`."
+  [prefix suffix]
+  (let [p (str (.tmpdir (js/require "os")) "/" prefix "-" (gensym) suffix)]
+    (.closeSync (js/require "fs") (.openSync (js/require "fs") p "wx"))
+    p))
+
+(defn delete-file! [p] (.unlinkSync (js/require "fs") p))
+
+(defn make-parents! [p]
+  (.mkdirSync (js/require "fs") (js/path.dirname (js/path.resolve (str p))) #js {:recursive true}))
+
+(defn write-bytes-str! [p s] (.writeFileSync (js/require "fs") (str p) s))
 
 ;; ── exit codes ───────────────────────────────────────────────────────────
 ;;
@@ -121,7 +147,7 @@
   "Path to ffmpeg, or nil. Checked once; a later disappearance shows up as a
   failed invocation rather than a silent skip."
   []
-  (let [{:keys [exit out]} (sh/sh "sh" "-c" "command -v ffmpeg")]
+  (let [{:keys [exit out]} (sh "sh" "-c" "command -v ffmpeg")]
     (when (zero? exit) (str/trim out))))
 
 (defn ffmpeg-provenance
@@ -132,7 +158,7 @@
   (if-not bin
     {:status :unavailable
      :reason "no ffmpeg on PATH (command -v ffmpeg found nothing)"}
-    (let [{:keys [exit out err]} (sh/sh bin "-version")]
+    (let [{:keys [exit out err]} (sh bin "-version")]
       (if-not (zero? exit)
         {:status :unavailable :reason (str "ffmpeg -version exited " exit ": " err)}
         (let [lines (str/split-lines out)]
@@ -141,16 +167,15 @@
            :version (first lines)
            :build (first (filter #(str/starts-with? % "configuration:") lines))})))))
 
-(defn- write-bytes! [^java.io.File f byte-vec]
-  (with-open [o (io/output-stream f)]
-    (.write o (byte-array (map unchecked-byte byte-vec)))))
+(defn- write-bytes! [f byte-vec]
+  (.writeFileSync (js/require "fs") (str f)
+                  (js/Buffer.from (into-array (map #(mod % 256) byte-vec)))))
 
-(defn- read-bytes [^java.io.File f]
-  (with-open [in (io/input-stream f)]
-    (mapv #(bit-and (int %) 0xff) (.readAllBytes in))))
+(defn- read-bytes [f]
+  (vec (.values (js/Uint8Array. (.readFileSync (js/require "fs") (str f))))))
 
-(defn- file->byte-array ^bytes [^java.io.File f]
-  (with-open [in (io/input-stream f)] (.readAllBytes in)))
+(defn- file->byte-array [f]
+  (read-bytes f))
 
 (defn decode-to-yuv-file!
   "ffmpeg's own reconstructed pixels for `mp4-file`, written to `out` as raw
@@ -162,9 +187,9 @@
   A check that cannot be afforded at the size that matters is a check that
   gets quietly dropped at that size, which is how the precondition would
   have stopped covering the arm the numbers actually come from."
-  [bin mp4-file ^java.io.File out]
-  (let [{:keys [exit err]} (sh/sh bin "-y" "-v" "error" "-i" (.getPath mp4-file)
-                                  "-pix_fmt" "yuv420p" "-f" "rawvideo" (.getPath out))]
+  [bin mp4-file out]
+  (let [{:keys [exit err]} (sh bin "-y" "-v" "error" "-i" (str mp4-file)
+                                  "-pix_fmt" "yuv420p" "-f" "rawvideo" (str out))]
     (when-not (zero? exit)
       (throw (ex-info "ffmpeg reference decode failed" {:exit exit :stderr err})))
     out))
@@ -176,23 +201,32 @@
   the length of `f`. Length is checked first: a file of the wrong size cannot
   be n copies of anything, and saying so before reading a hundred megabytes
   is free."
-  [^java.io.File f ^bytes pattern ^long n]
-  (let [plen (alength pattern)
-        expected (* (long plen) n)]
+  [f pattern n]
+  (let [fs (js/require "fs")
+        plen (.-length pattern)
+        expected (* plen n)
+        stat (.statSync fs (str f))]
     (and (pos? plen)
-         (= expected (.length f))
-         (with-open [in (io/input-stream f)]
-           (let [buf (byte-array 65536)]
+         (= expected (.-size stat))
+         (let [fd (.openSync fs (str f) "r")
+               buf (js/Buffer.allocUnsafe 65536)
+               pattern (js/Buffer.from (into-array (map #(mod % 256) pattern)))
+               plen (.-length pattern)]
+           (try
              (loop [pos 0]
-               (let [r (.read in buf)]
-                 (if (neg? r)
+               (let [r (.readSync fs fd buf 0 65536 pos)]
+                 (if (zero? r)
                    (= pos expected)
                    (if (loop [i 0]
                          (cond (= i r) true
-                               (= (aget buf i) (aget pattern (int (rem (+ pos i) plen)))) (recur (inc i))
+                               (= (aget buf i) (aget pattern (mod (+ pos i) plen))) (recur (inc i))
                                :else false))
-                     (recur (+ pos r))
-                     false)))))))))
+                     (if (< (+ pos r) expected)
+                       (recur (+ pos r))
+                       (= (+ pos r) expected))
+                     false)))
+               )
+             (finally (.closeSync fs fd)))))))
 
 ;; ── what gets timed: CPU, not wall ───────────────────────────────────────
 ;;
@@ -212,11 +246,11 @@
 ;; This is not a loosened tolerance. `perfgate`'s policy is untouched; what
 ;; changed is which quantity is handed to it.
 
-(def ^:private ^java.lang.management.ThreadMXBean thread-mx
-  (java.lang.management.ManagementFactory/getThreadMXBean))
-
-(def ^:private ^com.sun.management.OperatingSystemMXBean os-mx
-  (java.lang.management.ManagementFactory/getOperatingSystemMXBean))
+;; CPU time under kbb: js/process.cpuUsage is the whole-process getrusage
+;; delta in microseconds. There is no per-thread face on this host, so the
+;; thread figure and the process figure ARE the same quantity here — the
+;; undercount the JVM arm carried does not exist, and reporting the same
+;; number twice keeps the report's shape without inventing a difference.
 
 (def bench-line-re
   #"bench: utime=([0-9.]+)s stime=([0-9.]+)s rtime=([0-9.]+)s")
@@ -236,16 +270,16 @@
   A missing `bench:` line THROWS. An unreadable measurement must not be able
   to return the same value as a measurement of zero cost."
   [bin mp4-file]
-  (let [w0 (System/nanoTime)
-        {:keys [exit out err]} (sh/sh bin "-hide_banner" "-loglevel" "info" "-benchmark"
-                                      "-threads" "1" "-i" (.getPath mp4-file) "-f" "null" "-")
-        w1 (System/nanoTime)]
+  (let [w0 (js/performance.now)
+        {:keys [exit out err]} (sh bin "-hide_banner" "-loglevel" "info" "-benchmark"
+                                      "-threads" "1" "-i" (str mp4-file) "-f" "null" "-")
+        w1 (js/performance.now)]
     (when-not (zero? exit)
       (throw (ex-info "ffmpeg timed decode failed" {:exit exit :stderr err})))
     (if-let [[_ u sy r] (re-find bench-line-re (str out err))]
-      {:cpu-ms (* 1000.0 (+ (Double/parseDouble u) (Double/parseDouble sy)))
-       :ffmpeg-rtime-ms (* 1000.0 (Double/parseDouble r))
-       :wall-ms (/ (- w1 w0) 1e6)}
+      {:cpu-ms (* 1000.0 (+ (js/parseFloat u) (js/parseFloat sy)))
+       :ffmpeg-rtime-ms (* 1000.0 (js/parseFloat r))
+       :wall-ms (- w1 w0)}
       (throw (ex-info "ffmpeg -benchmark printed no utime line; its CPU time cannot be read"
                       {:stdout out :stderr err})))))
 
@@ -254,11 +288,10 @@
 (defn utsushi-decode-to-yuv
   "utsushi's decoded pixels in the same flat yuv420p layout ffmpeg writes,
   so the two are comparable as bytes with no adapter in between."
-  ^bytes [mp4-bytes]
-  (byte-array
-   (map unchecked-byte
-        (mapcat (fn [f] (concat (:luma f) (:cb f) (:cr f)))
-                (pipeline/decode-h264-frames mp4-bytes)))))
+  [mp4-bytes]
+  (vec (map #(mod % 256)
+            (mapcat (fn [f] (concat (:luma f) (:cb f) (:cr f)))
+                    (pipeline/decode-h264-frames mp4-bytes)))))
 
 (defn time-utsushi-decode
   "One in-process utsushi decode. Excludes JVM startup; taken after warm-up.
@@ -275,18 +308,22 @@
   slower` statement derived from it stays true. Both are reported so the size
   of the undercount is a number rather than a hand-wave."
   [mp4-bytes]
-  (let [p0 (.getProcessCpuTime os-mx)
-        c0 (.getCurrentThreadCpuTime thread-mx)
-        w0 (System/nanoTime)
+  (let [u0 (js/process.cpuUsage)
+        w0 (js/performance.now)
         frames (pipeline/decode-h264-frames mp4-bytes)
-        w1 (System/nanoTime)
-        c1 (.getCurrentThreadCpuTime thread-mx)
-        p1 (.getProcessCpuTime os-mx)]
+        w1 (js/performance.now)
+        u1 (js/process.cpuUsage)]
     (when (zero? (count frames))
       (throw (ex-info "utsushi decoded zero frames" {})))
-    {:cpu-ms (/ (- c1 c0) 1e6)
-     :process-cpu-ms (/ (- p1 p0) 1e6)
-     :wall-ms (/ (- w1 w0) 1e6)}))
+    ;; js/process.cpuUsage returns MICROSECONDS; /1000 -> ms. Under kbb there
+    ;; is no per-thread face, so both figures report the same measured
+    ;; quantity rather than one of them being invented.
+    (let [cpu-ms (/ (- (+ (.-user u1) (.-system u1))
+                       (+ (.-user u0) (.-system u0)))
+                    1000.0)]
+      {:cpu-ms cpu-ms
+       :process-cpu-ms cpu-ms
+       :wall-ms (- w1 w0)})))
 
 ;; ── one fixture ──────────────────────────────────────────────────────────
 
@@ -332,11 +369,11 @@
         f-long-mp4 (remux/concat-mp4s (repeat ffmpeg-stretch mp4))
         u-long-frames (frame-count u-long-mp4)
         f-long-frames (frame-count f-long-mp4)
-        u-long-file (java.io.File/createTempFile "utsushi-bench-ulong" ".mp4")
-        f-long-file (java.io.File/createTempFile "utsushi-bench-flong" ".mp4")
-        ref-short-yuv (java.io.File/createTempFile "utsushi-bench-refs" ".yuv")
-        ref-ulong-yuv (java.io.File/createTempFile "utsushi-bench-refu" ".yuv")
-        ref-flong-yuv (java.io.File/createTempFile "utsushi-bench-reff" ".yuv")]
+        u-long-file (temp-file! "utsushi-bench-ulong" ".mp4")
+        f-long-file (temp-file! "utsushi-bench-flong" ".mp4")
+        ref-short-yuv (temp-file! "utsushi-bench-refs" ".yuv")
+        ref-ulong-yuv (temp-file! "utsushi-bench-refu" ".yuv")
+        ref-flong-yuv (temp-file! "utsushi-bench-reff" ".yuv")]
     (try
       (write-bytes! u-long-file u-long-mp4)
       (write-bytes! f-long-file f-long-mp4)
@@ -347,12 +384,12 @@
             _ (decode-to-yuv-file! ffmpeg-bin f-long-file ref-flong-yuv)
             got-short (utsushi-decode-to-yuv mp4)
             got-u-long (utsushi-decode-to-yuv u-long-mp4)
-            agree-short? (java.util.Arrays/equals ^bytes ref-short ^bytes got-short)
-            agree-long? (java.util.Arrays/equals ^bytes ref-u-long ^bytes got-u-long)
+            agree-short? (= (vec ref-short) (vec got-short))
+            agree-long? (= (vec ref-u-long) (vec got-u-long))
             long-is-repetition? (repetition-of? ref-flong-yuv ref-short (long ffmpeg-stretch))]
         (if-not (and agree-short? agree-long? long-is-repetition?)
           {:status :mismatch
-           :fixture (.getName fixture-file)
+           :fixture (last (str/split (str fixture-file) #"/"))
            :short-frames short-frames
            :utsushi-long-frames u-long-frames :ffmpeg-long-frames f-long-frames
            :agree-short? agree-short? :agree-long? agree-long?
@@ -375,7 +412,7 @@
                 f-long (vec (repeatedly samples #(time-ffmpeg-decode ffmpeg-bin f-long-file)))
                 load-after (host/load1)]
             {:status :compared
-             :fixture (.getName fixture-file)
+             :fixture (last (str/split (str fixture-file) #"/"))
              :short-frames short-frames
              :utsushi-long-frames u-long-frames
              :ffmpeg-long-frames f-long-frames
@@ -392,11 +429,10 @@
              :ffmpeg {:samples-short f-short :samples-long f-long
                       :per-frame-cpu-ms (slopes f-short f-long short-frames f-long-frames :cpu-ms)
                       :per-frame-wall-ms (slopes f-short f-long short-frames f-long-frames :wall-ms)}})))
-      (catch Exception e
-        {:status :error :fixture (.getName fixture-file)
-         :message (.getMessage e) :data (ex-data e)})
-      (finally (run! #(.delete ^java.io.File %)
-                     [u-long-file f-long-file ref-short-yuv ref-ulong-yuv ref-flong-yuv])))))
+      (catch js/Error e
+        {:status :error :fixture (last (str/split (str fixture-file) #"/"))
+         :message (ex-message e) :data (ex-data e)})
+      (finally (run! delete-file! [u-long-file f-long-file ref-short-yuv ref-ulong-yuv ref-flong-yuv])))))
 
 
 ;; ── the gate ─────────────────────────────────────────────────────────────
@@ -533,7 +569,14 @@
 
 ;; ── report ───────────────────────────────────────────────────────────────
 
-(defn- fmt [x] (if (number? x) (format "%.3f" (double x)) "n/a"))
+(defn- fmt2 [x] (.toFixed (js/Number x) 2))
+(defn- fmt3
+  "kbb-safe `%.3f`: nbb's `format` does not reliably support %f, so
+   render via JS toFixed (the measured replacement from the bench map)."
+  [x] (let [n (js/Number x)]
+        (.toFixed n 3)))
+
+(defn- fmt [x] (if (number? x) (fmt3 (double x)) "n/a"))
 
 (defn- reason-lines
   "perfgate's refusals, WITH the arm each one is about.
@@ -669,8 +712,8 @@
                 (str "    utsushi / ffmpeg        " (fmt (:point env))
                      "x slower per frame (CPU); distribution-free envelope from the "
                      "observed samples: " (fmt (:low env)) "x .. " (fmt (:high env)) "x  ("
-                     (format "%.2f" (:decades-low env)) ".."
-                     (format "%.2f" (:decades-high env)) " decades)")
+                     (fmt2 (:decades-low env)) ".."
+                     (fmt2 (:decades-high env)) " decades)")
                 (str "    utsushi / ffmpeg        not derived: an unresolved slope "
                      "must not be divided into anything"))
               (str "    smallest improvement this noise could pass: "
@@ -693,8 +736,8 @@
     (if (empty? a)
       m
       (case (first a)
-        "--samples" (recur (drop 2 a) (assoc m :samples (Long/parseLong (second a))))
-        "--warmups" (recur (drop 2 a) (assoc m :warmups (Long/parseLong (second a))))
+        "--samples" (recur (drop 2 a) (assoc m :samples (js/parseInt (second a) 10)))
+        "--warmups" (recur (drop 2 a) (assoc m :warmups (js/parseInt (second a) 10)))
         "--out" (recur (drop 2 a) (assoc m :out (second a)))
         "--skip-kotoba-probe" (recur (rest a) (assoc m :skip-kotoba-probe? true))
         (recur (rest a) m)))))
@@ -708,13 +751,12 @@
   Returns `[]` when the manifest or a file named in it is missing — which
   becomes a refusal, not an empty run that reads as clean."
   []
-  (let [manifest (io/file fixtures-manifest)]
-    (if-not (.isFile manifest)
-      []
-      (vec (keep (fn [{:keys [file] :as m}]
-                   (let [f (io/file fixtures-dir file)]
-                     (when (.isFile f) (assoc m :fixture-file f))))
-                 (edn/read-string (slurp manifest)))))))
+  (if-not (exists-file? fixtures-manifest)
+    []
+    (vec (keep (fn [{:keys [file] :as m}]
+                 (let [f (str fixtures-dir "/" file)]
+                   (when (exists-file? f) (assoc m :fixture-file f))))
+               (edn/read-string (slurp-safe fixtures-manifest))))))
 
 (defn probe-engines
   "Availability of every engine in the roster, measured.
@@ -739,8 +781,7 @@
      :stage :execute
      :version (str "utsushi.pipeline.mp4-h264/decode-h264-frames over "
                    "org-iso-h264 h264.decode/decode-gop, full Clojure on "
-                   (System/getProperty "java.vm.name") " "
-                   (System/getProperty "java.version"))
+                   "kbb/js-host " (.-version js/process))
      :note "incumbent, not the destination — ADR-2607198300 wants no JVM at run time"}]
    (mapv (fn [{:keys [engine/target] :as e}]
            (merge e
@@ -841,11 +882,11 @@
                      :skip-kotoba-probe? skip-kotoba-probe?})]
     (doseq [l (render-lines report)] (println l))
     (when out
-      (io/make-parents out)
-      (with-open [w (io/writer out)] (pp/pprint report w))
+      (make-parents! out)
+      (write-bytes-str! out (with-out-str #_(pp/pprint report) (println report)))
       (println (str "report written to " out)))
     (flush)
-    (System/exit (case (:verdict report)
-                   :measured exit-measured
-                   :mismatch exit-mismatch
-                   exit-could-not-measure))))
+    (js/process.exit (case (:verdict report)
+                          :measured exit-measured
+                          :mismatch exit-mismatch
+                          exit-could-not-measure))))
