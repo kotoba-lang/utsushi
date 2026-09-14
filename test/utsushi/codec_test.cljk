@@ -3,14 +3,16 @@
    (`ffmpeg -f lavfi -i testsrc=size=96x64 ... -profile:v baseline`).
    `ffprobe` confirms the source is 96x64; utsushi.codec/decode should
    attach that exact width/height (read from the container's own avcC box,
-   via org-iso-h264's RBSP+SPS parser) to the demuxed video track."
-  (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
-            [isobmff.demux :as demux]
-            [utsushi.codec :as codec]))
+   via org-iso-h264's RBSP+SPS parser) to the demuxed video track.
 
-(defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+   Fixture bytes come from `utsushi.test-host` (kotoba.lang.fs + fs-host,
+   root-confined to the repo) — no `clojure.java.io` anywhere in test/."
+  (:require [clojure.test :refer [deftest is testing]]
+            [isobmff.demux :as demux]
+            [utsushi.codec :as codec]
+            [utsushi.test-host :as th]))
+
+(defn- rd [p] (th/resource-bytes p))
 
 (deftest h264-avcc-sps-params
   (let [d       (demux/demux (rd "utsushi/fixtures/sample.mp4"))
