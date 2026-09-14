@@ -16,16 +16,21 @@
   to state the load the numbers were taken at and let the reader discount
   them."
   (:require [kotoba.lang.text :as str]
-            [clojure.java.shell :as sh]
             [machine.core :as m]))
 
+;; Host boundary: shell probes over node:child_process (sync), plain data out.
+(defn- sh [& cmd]
+  (let [cp (js/require "child_process")
+        r (.spawnSync cp (nth cmd 0) (into-array (rest cmd)) #js {:encoding "utf8"})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
+
 (defn- sysctl [k]
-  (let [{:keys [exit out]} (sh/sh "sysctl" "-n" k)]
+  (let [{:keys [exit out]} (sh "sysctl" "-n" k)]
     (when (zero? exit) (str/trim out))))
 
 (defn- sysctl-long [k]
   (when-let [v (sysctl k)]
-    (try (Long/parseLong v) (catch Exception _ nil))))
+    (try (js/parseInt v 10) (catch :default _ nil))))
 
 (defn load1
   "One-minute load average, read from `sysctl -n vm.loadavg`, or nil if the
@@ -34,10 +39,10 @@
   []
   (when-let [v (sysctl "vm.loadavg")]
     (let [parts (str/split (str/replace v #"[{}]" "") #"\s+")]
-      (try (Double/parseDouble (second (remove str/blank? (cons "" parts))))
-           (catch Exception _
-             (try (Double/parseDouble (first (remove str/blank? parts)))
-                  (catch Exception _ nil)))))))
+      (try (js/parseFloat (second (remove str/blank? (cons "" parts))))
+           (catch :default _
+             (try (js/parseFloat (first (remove str/blank? parts)))
+                  (catch :default _ nil)))))))
 
 (defn descriptor
   "A `machine.core` descriptor for this host with `:measured` provenance.
@@ -55,7 +60,7 @@
         perf (sysctl-long "hw.perflevel0.logicalcpu")
         eff (sysctl-long "hw.perflevel1.logicalcpu")
         page (sysctl-long "hw.pagesize")
-        arch (let [{:keys [exit out]} (sh/sh "uname" "-m")]
+        arch (let [{:keys [exit out]} (sh "uname" "-m")]
                (when (zero? exit) (keyword (str/trim out))))
         measured? (boolean (and cores arch))
         clusters (when (and perf eff (pos? perf) (pos? eff))

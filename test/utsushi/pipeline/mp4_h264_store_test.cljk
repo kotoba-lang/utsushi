@@ -24,14 +24,13 @@
    corrupt-bytes/non-h264-codec `:decode/status :failed` coverage — see
    that namespace for the failure-path tests."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            [utsushi.test-host :as th]
             [isobmff.demux :as demux]
             [langchain.db :as db]
             [utsushi.pipeline.mp4-h264 :as pipeline]
             [utsushi.codec.store :as store]))
 
-(defn- rd-bytes [p]
-  (mapv #(bit-and (int %) 0xff) (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd-bytes [p] (th/resource-bytes p))
 
 (defn- fresh-conn [] (db/create-conn store/decode-schema))
 

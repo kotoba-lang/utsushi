@@ -25,15 +25,14 @@
    property `org-iso-h264`'s own `flat-multi-mb-roundtrip-bit-exact` test
    relies on)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            [utsushi.test-host :as th]
             [h264.encode :as h264-encode]
             [isobmff.demux :as demux]
             [utsushi.codec :as codec]
             [utsushi.pipeline.h264-mp4 :as encode-pipeline]
             [utsushi.pipeline.mp4-h264 :as decode-pipeline]))
 
-(defn- rd-bytes [p]
-  (mapv #(bit-and (int %) 0xff) (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd-bytes [p] (th/resource-bytes p))
 
 ;; ---- fixture A: flat luma, default (flat 128) chroma — lossless case ----
 

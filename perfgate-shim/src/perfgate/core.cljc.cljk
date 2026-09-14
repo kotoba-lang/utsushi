@@ -1,0 +1,242 @@
+(ns perfgate.core
+  "kbb-local copy of perfgate.core (deps.edn pin d4417d7). The gitlibs cache
+  checkout has no cljk-origin.edn manifest, so the engine cannot load it as a
+  ROOTS-owned root; this shim directory carries the manifest instead.
+  Unmodified port of the pinned source."
+  (:require [machine.core :as m]))
+
+(def format-id :kotoba.perfgate/v1)
+(def observation-format :kotoba.perfgate.observation/v1)
+(def claim-format :kotoba.perfgate.claim/v1)
+
+(defn- mean [xs] (if (seq xs) (/ (reduce + 0.0 xs) (count xs)) 0.0))
+
+(defn- stdev
+  "Sample standard deviation (n-1)."
+  [xs]
+  (let [n (count xs)]
+    (if (< n 2)
+      0.0
+      (let [mu (mean xs)]
+        (Math/sqrt (/ (reduce + 0.0 (map #(let [d (- % mu)] (* d d)) xs))
+                      (dec n)))))))
+
+(defn- percentile [xs p]
+  (if (empty? xs)
+    0.0
+    (let [sorted (vec (sort xs))
+          idx (min (dec (count sorted))
+                   (int (Math/floor (* p (count sorted)))))]
+      (nth sorted idx))))
+
+(defn summarize [xs]
+  (let [xs (vec xs)
+        mu (mean xs)
+        sd (stdev xs)]
+    {:n (count xs)
+     :mean mu
+     :stdev sd
+     :relative-stdev (if (pos? mu) (/ sd mu) 0.0)
+     :median (percentile xs 0.5)
+     :p95 (percentile xs 0.95)
+     :min (if (seq xs) (apply min xs) 0.0)
+     :max (if (seq xs) (apply max xs) 0.0)}))
+
+(defn observation
+  [{:keys [id plan-id machine metric unit samples source lower-is-better?]
+    :or {lower-is-better? true}}]
+  (when-not (and (string? source) (seq source))
+    (throw (ex-info "an observation needs a non-empty source"
+                    {:phase :perfgate/observation :id id})))
+  (when-not (and (sequential? samples) (seq samples) (every? number? samples))
+    (throw (ex-info "an observation needs at least one numeric sample"
+                    {:phase :perfgate/observation :id id :samples samples})))
+  (when-not (keyword? metric)
+    (throw (ex-info "an observation needs a metric keyword"
+                    {:phase :perfgate/observation :id id :metric metric})))
+  (m/validate! machine)
+  {:format observation-format
+   :observation/id id
+   :observation/plan-id plan-id
+   :observation/machine-id (:machine/id machine)
+   :observation/machine-fingerprint (m/fingerprint machine)
+   :observation/machine-provenance (:machine/provenance machine)
+   :observation/metric metric
+   :observation/unit unit
+   :observation/samples (vec samples)
+   :observation/source source
+   :observation/lower-is-better? lower-is-better?
+   :observation/summary (summarize samples)})
+
+(def default-policy
+  {:policy/id :kotoba.perfgate.policy/default-v1
+   :policy/min-samples 5
+   :policy/max-relative-stdev 0.10
+   :policy/min-improvement 0.05
+   :policy/require-provenance :measured
+   :policy/require-baseline? true})
+
+(defn- arm-reasons [label o policy]
+  (let [{:keys [n relative-stdev]} (:observation/summary o)]
+    (cond-> []
+      (< n (:policy/min-samples policy))
+      (conj {:reason :insufficient-samples :arm label
+             :n n :required (:policy/min-samples policy)})
+
+      (> relative-stdev (:policy/max-relative-stdev policy))
+      (conj {:reason :too-noisy :arm label
+             :relative-stdev relative-stdev
+             :allowed (:policy/max-relative-stdev policy)})
+
+      (not (m/at-least-as-strong? (:observation/machine-provenance o)
+                                  (:policy/require-provenance policy)))
+      (conj {:reason :provenance-too-weak :arm label
+             :provenance (:observation/machine-provenance o)
+             :required (:policy/require-provenance policy)
+             :note "a claim resting on assumed hardware numbers rests on nothing measured"}))))
+
+(defn qualify
+  ([candidate baseline] (qualify candidate baseline default-policy))
+  ([candidate baseline policy]
+   (let [policy (merge default-policy policy)
+         reasons
+         (cond-> (vec (concat (arm-reasons :candidate candidate policy)
+                              (when baseline (arm-reasons :baseline baseline policy))))
+
+           (and (:policy/require-baseline? policy) (nil? baseline))
+           (conj {:reason :no-baseline
+                  :note "\"fast\" is not a property of a single measurement"})
+
+           (and baseline (not= (:observation/metric candidate)
+                               (:observation/metric baseline)))
+           (conj {:reason :metric-mismatch
+                  :candidate (:observation/metric candidate)
+                  :baseline (:observation/metric baseline)})
+
+           (and baseline (not= (:observation/machine-fingerprint candidate)
+                               (:observation/machine-fingerprint baseline)))
+           (conj {:reason :machine-mismatch
+                  :note "the two arms were measured on different hardware; the
+                         difference between them is not the change you made"
+                  :candidate (:observation/machine-id candidate)
+                  :baseline (:observation/machine-id baseline)}))
+
+         better? (:observation/lower-is-better? candidate)
+         cs (:observation/summary candidate)
+         bs (:observation/summary baseline)
+         improvement (when baseline
+                       (let [b (:mean bs) c (:mean cs)]
+                         (cond
+                           (not (pos? b)) 0.0
+                           better? (/ (- b c) b)
+                           :else (/ (- c b) (max b 1e-12)))))
+         gap (when baseline (Math/abs (- (:mean bs) (:mean cs))))
+         noise (when baseline (+ (:stdev bs) (:stdev cs)))
+         separated? (when baseline (> gap noise))
+         reasons
+         (cond-> reasons
+           (and baseline improvement (< improvement (:policy/min-improvement policy)))
+           (conj {:reason :improvement-below-threshold
+                  :improvement improvement
+                  :required (:policy/min-improvement policy)})
+
+           (and baseline (not separated?))
+           (conj {:reason :not-separated-from-noise
+                  :gap gap :summed-stdev noise
+                  :note "the arms are closer together than their own spread"}))]
+     {:format format-id
+      :qualified? (empty? reasons)
+      :reasons reasons
+      :improvement improvement
+      :separation (when baseline {:gap gap :summed-stdev noise :separated? separated?})
+      :policy policy
+      :candidate (:observation/id candidate)
+      :baseline (:observation/id baseline)})))
+
+(defn claim
+  [verdict candidate baseline]
+  (when-not (:qualified? verdict)
+    (throw (ex-info "refusing to seal an unqualified result"
+                    {:phase :perfgate/claim :reasons (:reasons verdict)})))
+  (let [body {:format claim-format
+              :claim/plan-id (:observation/plan-id candidate)
+              :claim/metric (:observation/metric candidate)
+              :claim/unit (:observation/unit candidate)
+              :claim/improvement (:improvement verdict)
+              :claim/machine-id (:observation/machine-id candidate)
+              :claim/machine-fingerprint (:observation/machine-fingerprint candidate)
+              :claim/policy-id (get-in verdict [:policy :policy/id])
+              :claim/candidate candidate
+              :claim/baseline baseline}]
+    (assoc body :claim/fingerprint (m/fingerprint body))))
+
+(defn verify-claim
+  [c]
+  (let [body (dissoc c :claim/fingerprint)]
+    (when-not (= (:claim/fingerprint c) (m/fingerprint body))
+      (throw (ex-info "claim fingerprint does not match its contents"
+                      {:phase :perfgate/verify :claim/plan-id (:claim/plan-id c)})))
+    (let [verdict (qualify (:claim/candidate c) (:claim/baseline c)
+                           (assoc default-policy :policy/id (:claim/policy-id c)))]
+      (when-not (:qualified? verdict)
+        (throw (ex-info "claim no longer qualifies"
+                        {:phase :perfgate/verify :reasons (:reasons verdict)})))
+      c)))
+
+(defn stale-on?
+  [c machine]
+  (not= (:claim/machine-fingerprint c) (m/fingerprint machine)))
+
+(defn applicable
+  [claims machine]
+  (let [fp (m/fingerprint machine)]
+    {:machine-id (:machine/id machine)
+     :machine-fingerprint fp
+     :applicable (filterv #(= fp (:claim/machine-fingerprint %)) claims)
+     :stale (mapv (fn [c] {:claim/plan-id (:claim/plan-id c)
+                           :measured-on (:claim/machine-id c)
+                           :reason :machine-changed})
+                  (remove #(= fp (:claim/machine-fingerprint %)) claims))}))
+
+(defn explain
+  [verdict]
+  (into [(str (if (:qualified? verdict) "QUALIFIED" "REFUSED") ": "
+              (:candidate verdict) " against " (:baseline verdict)
+              (when-let [i (:improvement verdict)]
+                (str " (" (Math/round (* 100.0 i)) "% improvement)")))]
+        (mapv (fn [r] (str "  - " (name (:reason r))
+                           (when (:note r) (str ": " (:note r)))))
+              (:reasons verdict))))
+
+(defn minimum-detectable-improvement
+  ([baseline candidate] (minimum-detectable-improvement baseline candidate default-policy))
+  ([baseline candidate policy]
+   (let [policy (merge default-policy policy)
+         bs (:observation/summary baseline)
+         cs (:observation/summary candidate)
+         noise-floor (if (pos? (:mean bs))
+                       (/ (+ (:stdev bs) (:stdev cs)) (:mean bs))
+                       ##Inf)]
+     (max (:policy/min-improvement policy) noise-floor))))
+
+(defn detectable?
+  ([baseline candidate expected] (detectable? baseline candidate expected default-policy))
+  ([baseline candidate expected policy]
+   (let [floor (minimum-detectable-improvement baseline candidate policy)]
+     {:expected-improvement expected
+      :minimum-detectable floor
+      :detectable? (> expected floor)
+      :shortfall (when (<= expected floor) (- floor expected))
+      :remedy (when (<= expected floor)
+                (str "reduce noise or raise the effect: at this spread the gate cannot "
+                     "pass anything under " (Math/round (* 100.0 floor)) "%"))})))
+
+(defn samples-needed
+  ([baseline candidate expected] (samples-needed baseline candidate expected default-policy))
+  ([baseline candidate expected policy]
+   (let [floor (minimum-detectable-improvement baseline candidate policy)
+         n (:n (:observation/summary candidate))]
+     (if (> expected floor)
+       {:needed n :note "already detectable at the current sample count"}
+       {:needed (long (Math/ceil (* n (Math/pow (/ floor (max expected 1e-9)) 2))))
+        :note "assumes the spread is sampling jitter; it is not, if the machine is migrating threads"}))))

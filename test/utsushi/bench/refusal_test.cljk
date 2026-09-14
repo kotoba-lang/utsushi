@@ -11,7 +11,6 @@
    behind the `:bench` alias, so the refusal logic is checked on every run
    even though the timing is not."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
             [kotoba.lang.text :as str]
             [utsushi.bench.ffmpeg-comparison :as bench]
             [utsushi.bench.engines :as engines]))
@@ -100,34 +99,49 @@
             "no ratio may be rendered against an unresolved arm")
         (is (str/includes? text "arms resolved 1 of 2"))))))
 
+(defn- write-rep-file!
+  "Host-side stand-in for the old java.io temp file: write `reps` copies of the
+  pattern vector to a temp file and return its path string. Deletes nothing —
+  the caller unlinks through the host boundary."
+  [pattern reps]
+  (let [fs (js/require "fs")
+        os (js/require "os")
+        path (js/path.join (.tmpdir os) (str "rep-" (.-pid js/process) "-" (gensym) ".bin"))
+        buf (js/Buffer.allocUnsafe (* reps (.-length pattern)))]
+    (dotimes [i reps]
+      (.copy buf pattern (* i (.-length pattern))))
+    (.writeFileSync fs path buf)
+    path))
+
+(defn- unlink! [p] (.unlinkSync (js/require "fs") p))
+
 (deftest the-repetition-precondition-still-holds-at-a-hundred-megabytes
   (testing "the equal-result check that stands in for decoding ffmpeg's long
             stream with utsushi is streamed, so raising the stretch into the
             thousands does not quietly drop it"
-    (let [pattern (byte-array (map unchecked-byte [1 2 3 4 5]))
-          f (java.io.File/createTempFile "rep" ".bin")]
+    (let [pattern (js/Buffer.from #js [1 2 3 4 5])
+          f (write-rep-file! pattern 4)]
       (try
-        (with-open [o (io/output-stream f)]
-          (dotimes [_ 4] (.write o pattern)))
         (is (true? (bench/repetition-of? f pattern 4)))
         (is (false? (bench/repetition-of? f pattern 3)) "wrong length is not a repetition")
         (is (false? (bench/repetition-of? f pattern 5)))
-        (is (false? (bench/repetition-of? f (byte-array (map unchecked-byte [1 2 3 4 6])) 4))
+        (is (false? (bench/repetition-of? f (js/Buffer.from #js [1 2 3 4 6]) 4))
             "same length, one byte different, must be caught")
-        (finally (.delete f)))))
+        (finally (unlink! f)))))
   (testing "the check must span a buffer boundary, not just the first block"
-    (let [pattern (byte-array (map unchecked-byte (range 100)))
-          f (java.io.File/createTempFile "rep" ".bin")]
+    (let [pattern (js/Buffer.from (into-array (map #(mod % 256) (range 100))))
+          f (write-rep-file! pattern 2000)]
       (try
-        (with-open [o (io/output-stream f)]
-          (dotimes [_ 2000] (.write o pattern)))   ; 200 000 bytes > the 65 536 buffer
         (is (true? (bench/repetition-of? f pattern 2000)))
         ;; corrupt one byte in the third buffer-full
-        (with-open [raf (java.io.RandomAccessFile. f "rw")]
-          (.seek raf 150000) (.write raf (int 200)))
+        (let [fs (js/require "fs")]
+          (.openSync fs f "r+")
+          (let [fd (.openSync fs f "r+")]
+            (.writeSync fs fd #js [200] 0 1 150000)
+            (.closeSync fs fd)))
         (is (false? (bench/repetition-of? f pattern 2000))
             "a difference past the first buffer must still be found")
-        (finally (.delete f))))))
+        (finally (unlink! f))))))
 
 (deftest ffmpegs-cpu-time-is-read-from-its-own-benchmark-line
   (testing "the CPU number comes from ffmpeg's getrusage delta, not from a

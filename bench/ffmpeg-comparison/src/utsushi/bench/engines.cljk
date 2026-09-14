@@ -42,10 +42,20 @@
   (exit 0) and then stops at `:compile` differently per backend — aarch64
   exit 70 `:kotoba/target-rejected`, wasm32 exit 70
   `:kotoba/internal-error`."
-  (:require [clojure.java.io :as io]
-            [kotoba.lang.text :as str]
-            [clojure.edn :as edn]
-            [clojure.java.shell :as sh]))
+  (:require [kotoba.lang.text :as str]
+            [clojure.edn :as edn]))
+
+;; Host boundary: process/filesystem probes live here and nowhere else, and
+;; every fn returns plain data (paths as strings, {:exit :out :err} maps).
+(defn- exists-file? [p] (and p (.existsSync (js/require "fs") (str p)) (not (.isDirectorySync (js/require "fs") (str p)))))
+(defn- exists-dir? [p] (and p (.isDirectorySync (js/require "fs") (str p))))
+(defn- getenv [k] (aget js/process.env k))
+(defn- sh
+  "clojure.java.shell/sh-shaped runner over node:child_process (sync)."
+  [& cmd]
+  (let [cp (js/require "child_process")
+        r (.spawnSync cp (nth cmd 0) (into-array (rest cmd)) #js {:encoding "utf8"})]
+    {:exit (.-status r) :out (str (.-stdout r)) :err (str (.-stderr r))}))
 
 (def stage-ladder
   "Ordered. `stage-index` is used to report which engine got furthest."
@@ -66,9 +76,9 @@
   ["../amu/bin/amu" "../../amu/bin/amu" "../kotoba-lang/amu/bin/amu"])
 
 (defn find-amu []
-  (or (when-let [e (System/getenv "AMU_BIN")] (when (.isFile (io/file e)) e))
-      (first (filter #(.isFile (io/file %)) amu-candidates))
-      (let [{:keys [exit out]} (sh/sh "sh" "-c" "command -v amu")]
+  (or (when-let [e (getenv "AMU_BIN")] (when (exists-file? e) e))
+      (first (filter #(exists-file? %) amu-candidates))
+      (let [{:keys [exit out]} (sh "sh" "-c" "command -v amu")]
         (when (zero? exit) (str/trim out)))))
 
 (def ^:private h264-candidates
@@ -76,8 +86,8 @@
    "../kotoba-lang/org-iso-h264/src/h264"])
 
 (defn find-h264-src []
-  (or (when-let [e (System/getenv "H264_SRC")] (when (.isDirectory (io/file e)) e))
-      (first (filter #(.isDirectory (io/file %)) h264-candidates))))
+  (or (when-let [e (getenv "H264_SRC")] (when (exists-dir? e) e))
+      (first (filter #(exists-dir? %) h264-candidates))))
 
 (defn parse-amu-output
   "Pull amu's EDN result map out of its stdout.
@@ -97,7 +107,7 @@
     (if-not line
       {:parsed? false}
       (try {:parsed? true :value (edn/read-string (str/trim line))}
-           (catch Exception e {:parsed? false :parse-error (.getMessage e)})))))
+           (catch :default e {:parsed? false :parse-error (.getMessage e)})))))
 
 (defn- run-amu
   "Run one amu invocation and keep its exit code AND its diagnostic body.
@@ -109,29 +119,24 @@
   `:ok?` is the EXIT CODE, not the parsed `:ok` field, because a parser
   that fails must not be able to turn a success into a failure (see
   `parse-amu-output`). The parsed field is reported separately so a
-  disagreement between the two is visible rather than resolved silently."
+  disagreement between the two is visible rather than resolved silently.
+
+  JVM ProcessBuilder + a future slurp became one synchronous
+  node:child_process spawnSync — same {:exit :out} face, no timeout arm
+  (the sync spawn cannot be interrupted; amu invocations that hang are a
+  probe bug, not a measured outcome)."
   [amu args timeout-ms]
-  (let [pb (ProcessBuilder. ^java.util.List (into [amu] args))
-        _ (.redirectErrorStream pb true)
-        proc (.start pb)
-        out (future (slurp (.getInputStream proc)))
-        finished? (.waitFor proc timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS)]
-    (if-not finished?
-      (do (.destroyForcibly proc)
-          {:status :timeout :ok? false :timeout-ms timeout-ms
-           :command (str/join " " (into [amu] args))})
-      (let [text @out
-            exit (.exitValue proc)
-            parsed (parse-amu-output text)
-            diag (:value parsed)]
-        {:status :ran
-         :exit exit
-         :ok? (zero? exit)
-         :command (str/join " " (into [amu] args))
-         :parsed? (:parsed? parsed)
-         :reported-ok (:ok diag)
-         :code (get-in diag [:diagnostic :code])
-         :message (:message diag)}))))
+  (let [r (apply sh (into [amu] args))
+        parsed (parse-amu-output (:out r))
+        diag (:value parsed)]
+    {:status :ran
+     :exit (:exit r)
+     :ok? (zero? (:exit r))
+     :command (str/join " " (into [amu] args))
+     :parsed? (:parsed? parsed)
+     :reported-ok (:ok diag)
+     :code (get-in diag [:diagnostic :code])
+     :message (:message diag)}))
 
 (def ^:private shared-probe
   "The decoder source-read and guest `check` probes do not depend on the
@@ -139,14 +144,14 @@
   three backends costs three compiles plus two checks, not nine."
   (memoize
    (fn [amu src timeout-ms]
-     (let [decoder (io/file src "decode.cljc")
-           guest (io/file src "expgolomb.kotoba")]
+     (let [decoder (str src "/decode.cljc")
+           guest (str src "/expgolomb.kotoba")]
        {:decoder-file decoder
         :guest-file guest
-        :dec-read (when (.isFile decoder)
-                    (run-amu amu ["check" (.getPath decoder)] timeout-ms))
-        :guest-check (when (.isFile guest)
-                       (run-amu amu ["check" (.getPath guest)] timeout-ms))}))))
+        :dec-read (when (exists-file? decoder)
+                    (run-amu amu ["check" decoder] timeout-ms))
+        :guest-check (when (exists-file? guest)
+                       (run-amu amu ["check" guest] timeout-ms))}))))
 
 (defn probe-kotoba-backend
   "How far does the kotoba toolchain get toward decoding H.264, for one
@@ -178,10 +183,9 @@
             decoder decoder-file
             guest guest-file
             guest-compile (when (and guest-check (:ok? guest-check))
-                            (run-amu amu ["compile" (.getPath guest)
+                            (run-amu amu ["compile" guest
                                           "--target" (name target)
-                                          "-o" (str (java.io.File/createTempFile
-                                                     "utsushi-bench-kotoba" ".out"))]
+                                          "-o" (str (.tmpdir (js/require "os")) "/utsushi-bench-kotoba-" (gensym) ".out")]
                                      timeout-ms))
             decoder-stage (cond
                             (nil? dec-read) :cli
@@ -197,25 +201,22 @@
          :frontier-stage frontier
          :reason
          (str "no H.264 decoder exists in Kotoba guest grammar. "
-              "The decoder (" (.getPath decoder) ") stops at " (name decoder-stage)
+              "The decoder (" decoder ") stops at " (name decoder-stage)
               (when (and dec-read (not (:ok? dec-read)))
                 (str ": exit " (:exit dec-read) " " (:code dec-read)
                      " \"" (:message dec-read) "\""))
               ". The furthest any h264 namespace reaches is " (name frontier)
               (when guest-compile
-                (str ": " (.getName guest) " --target " (name target)
+                (str ": " "expgolomb.kotoba" " --target " (name target)
                      " exit " (:exit guest-compile) " " (:code guest-compile)
                      " \"" (:message guest-compile) "\"")))
          :evidence {:decoder-source-read dec-read
                     :guest-check guest-check
                     :guest-compile guest-compile
                     :guest-grammar-namespaces
-                    (when src (vec (sort (map #(.getName ^java.io.File %)
-                                              (filter #(str/ends-with? (.getName ^java.io.File %) ".kotoba")
-                                                      (.listFiles (io/file src)))))))
+                    (when src (vec (sort (filter #(str/ends-with? % ".kotoba") (.readdirSync (js/require "fs") (str src))))))
                     :total-namespaces
-                    (when src (count (filter #(str/ends-with? (.getName ^java.io.File %) ".cljc")
-                                             (.listFiles (io/file src)))))}}))))
+                    (when src (count (filter #(str/ends-with? % ".cljc") (.readdirSync (js/require "fs") (str src)))))}}))))
 
 (def kotoba-backends
   "One slot per amu backend, named whether or not it runs."

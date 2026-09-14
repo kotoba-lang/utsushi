@@ -45,15 +45,12 @@
    encoder output here — that gap is real and is recorded rather than
    papered over with a synthetic bitstream."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            [utsushi.test-host :as th]
             [isobmff.demux :as demux]
             [h264.bitstream :as bs]
-            [utsushi.pipeline.mp4-h264 :as pipeline])
-  (:import [clojure.lang ExceptionInfo]))
+            [utsushi.pipeline.mp4-h264 :as pipeline]))
 
-(defn- rd-bytes [p]
-  (mapv #(bit-and (int %) 0xff)
-        (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd-bytes [p] (th/resource-bytes p))
 
 (def ^:private w 32)
 (def ^:private h 32)
@@ -108,7 +105,7 @@
             silently mis-decoded — libx264 cannot be configured to avoid it
             (--partitions none leaves analyse=0x1:0 = X264_ANALYSE_I4x4)"
     (let [mp4 (rd-bytes "utsushi/fixtures/mp4-h264-i4x4-reject.mp4")
-          e (is (thrown? ExceptionInfo (pipeline/decode-h264-frames mp4)))]
+          e (is (thrown? js/Error (pipeline/decode-h264-frames mp4)))]
       (is (= 0 (:mb-type (ex-data e)))
           "mb_type 0 in an I-slice is I_NxN")
       (is (= "I_NxN (Intra_4x4/8x8) not implemented" (:reason (ex-data e)))
@@ -149,5 +146,5 @@
             different reason"
     (let [track (pipeline/video-track
                  (demux/demux (rd-bytes "utsushi/fixtures/mp4-h264-gop32x3.mp4")))]
-      (is (thrown-with-msg? ExceptionInfo #"no samples to decode"
+      (is (thrown-with-msg? js/Error #"no samples to decode"
                             (pipeline/track->annexb track []))))))

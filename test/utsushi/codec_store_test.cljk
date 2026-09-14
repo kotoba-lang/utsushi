@@ -20,12 +20,11 @@
    also validates its Datomic-shaped backend in-process against
    `langchain.db` without a live Datomic Local/Peer)."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
+            [utsushi.test-host :as th]
             [langchain.db :as db]
             [utsushi.codec.store :as store]))
 
-(defn- rd [p] (mapv #(bit-and (int %) 0xff)
-                    (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd [p] (th/resource-bytes p))
 
 (defn- fresh-conn [] (db/create-conn store/decode-schema))
 
@@ -58,7 +57,7 @@
 (deftest decode-frame-records-failed-status-on-a-corrupt-stream
   (let [conn (fresh-conn)
         garbage (vec (repeat 32 0))]
-    (is (thrown? clojure.lang.ExceptionInfo (store/decode-frame! conn "job-bad" garbage)))
+    (is (thrown? js/Error (store/decode-frame! conn "job-bad" garbage)))
     (let [job (store/job-entity conn "job-bad" {})]
       (testing "status recorded as :failed even though decode-frame! threw"
         (is (= :failed (:decode/status job))))
@@ -67,5 +66,5 @@
 
 (deftest decode-frame-rejects-non-h264-codec
   (let [conn (fresh-conn)]
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"only :h264 is wired"
+    (is (thrown-with-msg? js/Error #"only :h264 is wired"
                           (store/decode-frame! conn "job-av1" [] {:codec :av1})))))
