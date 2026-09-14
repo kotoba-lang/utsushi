@@ -26,14 +26,12 @@
    not asserted here, because a test that quietly passes when ffmpeg is
    absent would report the same value as one that ran and compared."
   (:require [clojure.test :refer [deftest is testing]]
-            [clojure.java.io :as io]
             [isobmff.demux :as demux]
             [utsushi.pipeline.remux :as remux]
-            [utsushi.pipeline.mp4-h264 :as pipeline]))
+            [utsushi.pipeline.mp4-h264 :as pipeline]
+            [utsushi.test-host :as th]))
 
-(defn- rd-bytes [p]
-  (mapv #(bit-and (int %) 0xff)
-        (with-open [in (io/input-stream (io/resource p))] (.readAllBytes in))))
+(defn- rd-bytes [p] (th/resource-bytes p))
 
 (defn- frames->yuv420p
   "Decoded frames → the same flat planar layout ffmpeg writes with
@@ -89,10 +87,10 @@
             returning wrong pixels"
     (let [headless (remux/trim @src 1 3)]
       (is (= 2 (count (:samples (pipeline/video-track (demux/demux headless))))))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+      (is (thrown-with-msg? js/Error
                             #"P-slice requires a previously-decoded reference frame"
                             (pipeline/decode-h264-frames headless))))))
 
 (deftest trim-range-validation
   (testing "an inverted range is refused rather than quietly returning nothing"
-    (is (thrown? clojure.lang.ExceptionInfo (remux/trim @src 2 1)))))
+    (is (thrown? js/Error (remux/trim @src 2 1)))))
