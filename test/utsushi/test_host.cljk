@@ -1,0 +1,57 @@
+(ns utsushi.test-host
+  "Test-side filesystem adapter: the ONLY place in test/ that touches the host
+  filesystem. Every `clojure.java.io` require in test/ points here instead.
+
+  `read-bytes!` replaces the `(mapv #(bit-and (int %) 0xff) (.readAllBytes
+  (io/input-stream (io/resource p))))` fixture pattern: `kotoba.lang.fs-host`'s
+  `read-bytes` already returns numbers 0..255 (cljs readFileSync + Uint8Array),
+  so the fixtures arrive as the same byte vectors the tests compare against.
+
+  `resource-bytes` keeps the `io/resource` path convention (`utsushi/fixtures/
+  ...` under the repo's `resources/` dir); the repo root is derived from THIS
+  namespace's own `*file*`, which is absolute inside a required namespace
+  under kbb (nil in `-e`, and `js/__dirname` is nil too).
+
+  Requires `kotoba.lang.text` explicitly: `str/last-index-of` below resolves
+  only through its own :require under kbb's sci analysis (an inline/aliased
+  reference to another ns's export is not analysed through transitive loads)."
+  (:require [kotoba.lang.fs :as fs]
+            [kotoba.lang.fs-host :as fs-host]
+            [kotoba.lang.text :as str]))
+
+(def root
+  "Absolute repo root, derived from this file's own absolute path:
+  <root>/test/utsushi/test_host.cljk -> three segments up."
+  (let [here (str *file*)]
+    (loop [s here n 0]
+      (if (= n 3)
+        s
+        (let [i (str/last-index-of s "/")]
+          (if (nil? i)
+            (throw (ex-info "utsushi.test-host: cannot derive repo root from *file*"
+                            {:file (str *file*)}))
+            (recur (subs s 0 i) (inc n))))))))
+
+(def fsys
+  "Host filesystem confined to the repo root."
+  (fs-host/host-filesystem {:root root}))
+
+(defn read-bytes!
+  "Fixture bytes as a vector of numbers 0..255, from a repo-root-relative path."
+  [p]
+  (fs/read-bytes fsys (str "resources/" p)))
+
+(defn read-string!
+  "A fixture as text, from a repo-root-relative path."
+  [p]
+  (fs/read fsys (str "resources/" p)))
+
+(defn resource-bytes
+  "`io/resource`-shaped byte read."
+  [p]
+  (read-bytes! p))
+
+(defn exists?
+  "Repo-root-relative existence probe."
+  [p]
+  (fs/exists? fsys (str "resources/" p)))
