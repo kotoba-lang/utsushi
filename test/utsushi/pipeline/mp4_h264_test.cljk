@@ -28,8 +28,8 @@
    luma plane only (first width*height bytes of the yuv420p file), no
    tolerance/epsilon."
   (:require [clojure.test :refer [deftest is testing]]
-            [utsushi.test-host :as th]
-            [utsushi.pipeline.mp4-h264 :as pipeline]))
+            [utsushi.pipeline.mp4-h264 :as pipeline]
+            [utsushi.test-host :as th]))
 
 (defn- rd-bytes [p] (th/resource-bytes p))
 
