@@ -29,7 +29,7 @@
   "test/utsushi/pipeline/h264_mp4_test.cljk" ".clj"
   "test/utsushi/pipeline/mp4_h264_gop_test.cljk" ".clj"
   "test/utsushi/pipeline/mp4_h264_store_test.cljk" ".clj"
-  "test/utsushi/pipeline/mp4_h264_test.cljk" ".clj"
+  "test/utsushi/pipeline/mp4_h264_test.cljk" ".cljc"
   "test/utsushi/pipeline/remux_test.cljk" ".cljc"
   "test/utsushi/pregel_test.cljk" ".cljc"
   "test/utsushi/raster_test.cljk" ".cljc"}}
