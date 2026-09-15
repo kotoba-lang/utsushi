@@ -34,4 +34,5 @@
   "test/utsushi/pregel_test.cljk" ".cljc"
   "test/utsushi/raster_test.cljk" ".cljc"
   "machine-shim/src/machine/core.cljc.cljk" ".cljc"
-  "perfgate-shim/src/perfgate/core.cljc.cljk" ".cljc"}}
+  "perfgate-shim/src/perfgate/core.cljc.cljk" ".cljc"
+  "target/run-suite.cljk" ".cljc"}}

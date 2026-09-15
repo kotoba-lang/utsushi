@@ -106,10 +106,11 @@
   [pattern reps]
   (let [fs (js/require "fs")
         os (js/require "os")
-        path (js/path.join (.tmpdir os) (str "rep-" (.-pid js/process) "-" (gensym) ".bin"))
+        path (str (.tmpdir os) "/rep-" (.-pid js/process) "-" (gensym) ".bin")
         buf (js/Buffer.allocUnsafe (* reps (.-length pattern)))]
     (dotimes [i reps]
-      (.copy buf pattern (* i (.-length pattern))))
+      (dotimes [j (.-length pattern)]
+        (aset buf (+ (* i (.-length pattern)) j) (aget pattern j))))
     (.writeFileSync fs path buf)
     path))
 
@@ -137,7 +138,7 @@
         (let [fs (js/require "fs")]
           (.openSync fs f "r+")
           (let [fd (.openSync fs f "r+")]
-            (.writeSync fs fd #js [200] 0 1 150000)
+            (.writeSync fs fd (js/Buffer.from #js [200]) 0 1 150000)
             (.closeSync fs fd)))
         (is (false? (bench/repetition-of? f pattern 2000))
             "a difference past the first buffer must still be found")

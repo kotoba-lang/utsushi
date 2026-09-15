@@ -44,7 +44,7 @@
 
 (defn- threw? [f kind]
   (try (f) false
-       (catch #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core/ExceptionInfo) e
+       (catch js/Error e
          (= kind (:kind (ex-data e))))))
 
 (deftest bsp-determinism-and-re-encode-free-pipeline
