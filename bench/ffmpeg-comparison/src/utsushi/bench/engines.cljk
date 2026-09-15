@@ -47,8 +47,9 @@
 
 ;; Host boundary: process/filesystem probes live here and nowhere else, and
 ;; every fn returns plain data (paths as strings, {:exit :out :err} maps).
-(defn- exists-file? [p] (and p (.existsSync (js/require "fs") (str p)) (not (.isDirectorySync (js/require "fs") (str p)))))
-(defn- exists-dir? [p] (and p (.isDirectorySync (js/require "fs") (str p))))
+(defn- exists-file? [p] (and p (.existsSync (js/require "fs") (str p))
+                            (try (not (.isDirectory (.statSync (js/require "fs") (str p)))) (catch :default _ false))))
+(defn- exists-dir? [p] (and p (try (.isDirectory (.statSync (js/require "fs") (str p))) (catch :default _ false))))
 (defn- getenv [k] (aget js/process.env k))
 (defn- sh
   "clojure.java.shell/sh-shaped runner over node:child_process (sync)."

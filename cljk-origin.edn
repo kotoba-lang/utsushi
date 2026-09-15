@@ -3,11 +3,11 @@
  :decision "adr-2609111500-cljk-rename-all-clojure-source (com-junkawasaki/root 90-docs/adr; owner instruction 2026-09-11)"
  :rule "value = the extension the file had before the rename. A path ending in .clj.cljk or .cljs.cljk kept it in the name because both platform files existed (or the plain target was taken)."
  :origins
- {"bench/decode-cost-attribution/src/utsushi/bench/attribution.cljk" ".clj"
-  "bench/ffmpeg-comparison/src/utsushi/bench/engines.cljk" ".clj"
-  "bench/ffmpeg-comparison/src/utsushi/bench/ffmpeg_comparison.cljk" ".clj"
-  "bench/ffmpeg-comparison/src/utsushi/bench/generate_fixtures.cljk" ".clj"
-  "bench/ffmpeg-comparison/src/utsushi/bench/host.cljk" ".clj"
+ {"bench/decode-cost-attribution/src/utsushi/bench/attribution.cljk" ".cljc"
+  "bench/ffmpeg-comparison/src/utsushi/bench/engines.cljk" ".cljc"
+  "bench/ffmpeg-comparison/src/utsushi/bench/ffmpeg_comparison.cljk" ".cljc"
+  "bench/ffmpeg-comparison/src/utsushi/bench/generate_fixtures.cljk" ".cljc"
+  "bench/ffmpeg-comparison/src/utsushi/bench/host.cljk" ".cljc"
   "bench/ffmpeg-comparison/src/utsushi/bench/profile.cljk" ".cljc"
   "src/utsushi/backend.cljk" ".cljc"
   "src/utsushi/codec.cljk" ".cljc"
@@ -32,4 +32,7 @@
   "test/utsushi/pipeline/mp4_h264_test.cljk" ".cljc"
   "test/utsushi/pipeline/remux_test.cljk" ".cljc"
   "test/utsushi/pregel_test.cljk" ".cljc"
-  "test/utsushi/raster_test.cljk" ".cljc"}}
+  "test/utsushi/raster_test.cljk" ".cljc"
+  "machine-shim/src/machine/core.cljc.cljk" ".cljc"
+  "perfgate-shim/src/perfgate/core.cljc.cljk" ".cljc"
+  "target/run-suite.cljk" ".cljc"}}

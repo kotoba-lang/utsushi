@@ -61,14 +61,22 @@
   may be claimed, and a refusal is printed as the result it is.
 
   Run: `kbb -M:bench-attribution [--samples N] [--reps N] [--out FILE]`"
-  (:require [clojure.java.io :as io]
-            [clojure.pprint :as pp]
+  (:require [kotoba.lang.text :as str]
             [perfgate.core :as g]
             [utsushi.bench.host :as host]
             [h264.decode :as decode]
             [h264.transform :as transform]
-            [utsushi.pipeline.mp4-h264 :as pipeline])
-  (:gen-class))
+            [utsushi.pipeline.mp4-h264 :as pipeline]))
+
+(def ^:private fs (js/require "fs"))
+
+(defn- exists-file? [p]
+  (try (and (.existsSync fs (str p))
+            (not (.isDirectory (.statSync fs (str p)))))
+       (catch js/Error _ false)))
+
+(defn- file-name [p]
+  (last (str/split (str p) #"/")))
 
 (def exit-measured 0)
 (def exit-mismatch 1)
@@ -81,8 +89,12 @@
 ;; unqualified ratio be quoted as a clean result.
 (def exit-unqualified 4)
 
-(def ^:private ^java.lang.management.ThreadMXBean thread-mx
-  (java.lang.management.ManagementFactory/getThreadMXBean))
+;; CPU time under kbb: js/process.cpuUsage is the whole-process getrusage
+;; delta in microseconds (the measured replacement for ThreadMXBean's
+;; thread-CPU face; see utsushi.bench.ffmpeg-comparison's timing section).
+(defn- thread-cpu-us []
+  (let [u (js/process.cpuUsage)]
+    (+ (.-user u) (.-system u))))
 
 ;; ── the production functions under test ──────────────────────────────────
 ;;
@@ -208,9 +220,8 @@
 
 ;; ── inputs, taken from a real decode ─────────────────────────────────────
 
-(defn- read-bytes [^java.io.File f]
-  (with-open [in (io/input-stream f)]
-    (mapv #(bit-and (int %) 0xff) (.readAllBytes in))))
+(defn- read-bytes [p]
+  (vec (.values (js/Uint8Array. (.readFileSync fs (str p))))))
 
 (defn- slice-mb
   "One macroblock's `blk-size`x`blk-size` grid out of a flat decoded plane,
@@ -405,13 +416,13 @@
   the primitive arm (whose result is an identity-hashed array) never paid.
   That is the measurement charging one arm for the harness."
   [f reps]
-  (let [c0 (.getCurrentThreadCpuTime thread-mx)
+  (let [c0 (thread-cpu-us)
         sink (loop [i 0 acc 0]
                (if (= i reps)
                  acc
                  (recur (inc i) (unchecked-add acc (long (f))))))
-        c1 (.getCurrentThreadCpuTime thread-mx)]
-    {:cpu-ms (/ (- c1 c0) 1e6) :sink sink}))
+        c1 (thread-cpu-us)]
+    {:cpu-ms (/ (- c1 c0) 1000.0) :sink sink}))
 
 (defn measure
   "Interleaved samples for a set of named arms.
@@ -436,29 +447,75 @@
   (g/observation {:id id :machine machine :metric metric :unit :ms
                   :samples samples :source source}))
 
-(defn- fmt [x] (if (number? x) (format "%.4f" (double x)) (str x)))
+(defn- fmt4 [x] (.toFixed (js/Number x) 4))
+(defn- fmt1 [x] (.toFixed (js/Number x) 1))
 
-(defn- pct [x] (format "%.1f%%" (* 100.0 (double x))))
+(defn- fmt [x] (if (number? x) (fmt4 (double x)) (str x)))
+
+(defn- pct [x] (str (fmt1 (* 100.0 (double x))) "%"))
+
+
+;; kbb-safe printf: nbb's `format` does not reliably support %f/%d directives,
+;; so render through a tiny directive interpreter (measured bench map rule:
+;; (format "%.4f" x) is broken under nbb -> toFixed-style rendering).
+(defn- kfmt
+  [fmt-str and-rest]
+  (let [as (vec and-rest)]
+    (loop [i 0 ai 0 out []]
+      (if (>= i (count fmt-str))
+        (str/join out)
+        (let [c (nth fmt-str i)]
+          (if (and (= c "%") (< (inc i) (count fmt-str)))
+            (let [d (nth fmt-str (inc i))]
+              (cond
+                (= d "%")
+                (recur (+ i 2) ai (conj out "%"))
+                (or (= d "-") (= d "0"))
+                (let [j (loop [k (+ i 2)]
+                          (if (and (< k (count fmt-str))
+                                   (not (js/Number.isNaN (js/Number (nth fmt-str k)))))
+                            (recur (inc k))
+                            k))
+                      ndigits (- j (+ i 2))
+                      conv (when (< j (count fmt-str)) (nth fmt-str j))
+                      a (nth as ai)]
+                  (if (= conv "s")
+                    (recur (inc j) (inc ai) (conj out (if (string? a) a (str a))))
+                    (recur (inc j) (inc ai) (conj out (str "%" (subs fmt-str i (inc j)))))))
+                (and (= d ".") (< (+ i 3) (count fmt-str)) (= (nth fmt-str (+ i 2)) "."))
+                (let [width (js/parseInt (subs fmt-str (+ i 3) (+ i 4)) 10)]
+                  (if (number? width)
+                    (let [a (nth as ai)]
+                      (recur (+ i 5) (inc ai)
+                             (conj out (if (number? a) (.toFixed (js/Number (double a)) width) (str a)))))
+                    (recur (+ i 2) ai (conj out (str "%" d)))))
+                (or (= d "s") (= d "d"))
+                (let [a (nth as ai)]
+                  (recur (+ i 2) (inc ai)
+                         (conj out (cond (= d "d") (str (js/Number a))
+                                         (string? a) a
+                                         :else (str a)))))
+                :else
+                (recur (+ i 2) ai (conj out (str "%" d)))))
+            (recur (inc i) ai (conj out (str c)))))))))
 
 ;; ── report ───────────────────────────────────────────────────────────────
 
 (defn- print-pair [nm {:keys [persistent primitive verdict ratio]}]
   (println)
-  (println (format "-- %s" (name nm)))
+  (println (kfmt "-- %s" [(name nm)]))
   (doseq [[label o] [["persistent" persistent] ["primitive " primitive]]]
     (let [sm (:observation/summary o)]
-      (println (format "   %s  mean %s ms/frame  median %s  rel-stdev %s  n %d"
-                       label (fmt (:mean sm)) (fmt (:median sm))
-                       (fmt (:relative-stdev sm)) (:n sm)))))
-  (println (format "   ratio persistent/primitive  %s x" (fmt ratio)))
+      (println (kfmt "   %s  mean %s ms/frame  median %s  rel-stdev %s  n %d" [label (fmt (:mean sm)) (fmt (:median sm))
+                       (fmt (:relative-stdev sm)) (:n sm)]))))
+  (println (kfmt "   ratio persistent/primitive  %s x" [(fmt ratio)]))
   (if (:qualified? verdict)
-    (println (format "   perfgate: QUALIFIED  improvement %s  gap %s > summed-stdev %s"
-                     (pct (:improvement verdict))
+    (println (kfmt "   perfgate: QUALIFIED  improvement %s  gap %s > summed-stdev %s" [(pct (:improvement verdict))
                      (fmt (get-in verdict [:separation :gap]))
-                     (fmt (get-in verdict [:separation :summed-stdev]))))
+                     (fmt (get-in verdict [:separation :summed-stdev]))]))
     (do (println "   perfgate: REFUSED -- this ratio is NOT a qualified result")
         (doseq [r (:reasons verdict)]
-          (println (format "     - %s %s" (name (:reason r)) (pr-str (dissoc r :reason))))))))
+          (println (kfmt "     - %s %s" [(name (:reason r)) (pr-str (dissoc r :reason))]))))))
 
 (defn- noise-check
   "perfgate's own single-arm tests, applied to a component that has no
@@ -482,32 +539,31 @@
   (let [sm (:observation/summary o)
         reasons (noise-check o)]
     (println)
-    (println (format "-- %s (component; no baseline, so no speed claim)" (name nm)))
-    (println (format "   mean %s ms/frame  median %s  rel-stdev %s  n %d"
-                     (fmt (:mean sm)) (fmt (:median sm)) (fmt (:relative-stdev sm)) (:n sm)))
+    (println (kfmt "-- %s (component; no baseline, so no speed claim)" [(name nm)]))
+    (println (kfmt "   mean %s ms/frame  median %s  rel-stdev %s  n %d" [(fmt (:mean sm)) (fmt (:median sm)) (fmt (:relative-stdev sm)) (:n sm)]))
     (when (and total-mean (pos? (double total-mean)))
-      (println (format "   share of full decode  %s" (pct (/ (:mean sm) (double total-mean))))))
+      (println (kfmt "   share of full decode  %s" [(pct (/ (:mean sm) (double total-mean)))])))
     (if (empty? reasons)
       (println "   perfgate single-arm tests: pass (samples, spread, provenance)")
       (do (println "   perfgate single-arm tests: REFUSED")
           (doseq [r reasons]
-            (println (format "     - %s %s" (name (:reason r)) (pr-str (dissoc r :reason)))))))))
+            (println (kfmt "     - %s %s" [(name (:reason r)) (pr-str (dissoc r :reason))])))))))
 
-(defn -main [& args]
+(defn main [& args]
   (let [opts (loop [a args m {:samples 9 :reps 20 :fixture "gop320x240.mp4"}]
                (if (empty? a)
                  m
                  (case (first a)
-                   "--samples" (recur (drop 2 a) (assoc m :samples (Long/parseLong (second a))))
-                   "--reps" (recur (drop 2 a) (assoc m :reps (Long/parseLong (second a))))
+                   "--samples" (recur (drop 2 a) (assoc m :samples (js/parseInt (second a) 10)))
+                   "--reps" (recur (drop 2 a) (assoc m :reps (js/parseInt (second a) 10)))
                    "--fixture" (recur (drop 2 a) (assoc m :fixture (second a)))
                    "--out" (recur (drop 2 a) (assoc m :out (second a)))
                    (recur (rest a) m))))
-        f (io/file "bench/ffmpeg-comparison/fixtures" (:fixture opts))]
-    (when-not (.isFile f)
-      (println "no such fixture:" (.getPath f))
+        f (str "bench/ffmpeg-comparison/fixtures/" (:fixture opts))]
+    (when-not (exists-file? f)
+      (println "no such fixture:" f)
       (println "generate it with: kbb -M:bench-fixtures")
-      (System/exit exit-could-not-measure))
+      (js/process.exit exit-could-not-measure))
     (let [machine (host/descriptor)
           load-before (host/load1)
           mp4 (read-bytes f)
@@ -515,21 +571,20 @@
           n-frames (count frames)]
       (when (zero? n-frames)
         (println "decoded zero frames; nothing to attribute")
-        (System/exit exit-could-not-measure))
+        (js/process.exit exit-could-not-measure))
       (let [frame (first frames)
             inputs (prepare-inputs frame)
             {:keys [ok? checks]} (check-arms inputs)]
-        (println (format "fixture %s   %dx%d   %d macroblocks   %d frames   host %s   load1 before %s"
-                         (.getName f) (:width inputs) (:height inputs) (:num-mb inputs)
-                         n-frames (:machine/id machine) (str load-before)))
+        (println (kfmt "fixture %s   %dx%d   %d macroblocks   %d frames   host %s   load1 before %s" [(file-name f) (:width inputs) (:height inputs) (:num-mb inputs)
+                         n-frames (:machine/id machine) (str load-before)]))
         (println)
         (println "equality checks (nothing is timed unless all pass):")
         (doseq [c checks]
-          (println (format "  %-52s %s" (name (:check c)) (if (:ok? c) "ok" "FAILED"))))
+          (println (kfmt "  %-52s %s" [(name (:check c)) (if (:ok? c) "ok" "FAILED")])))
         (when-not ok?
           (println)
           (println "REFUSING to time arms that computed different pixels")
-          (System/exit exit-mismatch))
+          (js/process.exit exit-mismatch))
         (dotimes [_ 3]
           (residual-add-persistent-frame inputs)
           (residual-add-primitive-frame inputs)
@@ -573,7 +628,7 @@
                     (str "utsushi.bench.attribution " (name op) "/" (name arm) "; "
                          r " reps x " u " frame(s) per sample, " (:samples opts)
                          " samples, all arms interleaved in one loop; "
-                         "ThreadMXBean.getCurrentThreadCpuTime; fixture " (.getName f)
+                         "js/process.cpuUsage (process getrusage delta); fixture " (file-name f)
                          "; load1 " load-before " -> " load-after))
               obs (into {}
                         (for [[[op arm :as k] {:keys [reps units]}] arms]
@@ -596,13 +651,13 @@
           (println)
           (println "-- shares of the full decode, all measured in this one run")
           (doseq [[op v] pairs]
-            (println (format "   %-16s persistent %s of full decode" (name op)
+            (println (kfmt "   %-16s persistent %s of full decode" [(name op)
                              (pct (/ (:mean (:observation/summary (:persistent v)))
-                                     (double total-mean))))))
+                                     (double total-mean)))])))
           (println)
-          (println (format "load1 after %s   (before %s)" (str load-after) (str load-before)))
+          (println (kfmt "load1 after %s   (before %s)" [(str load-after) (str load-before)]))
           (let [report {:format :utsushi.bench.attribution/v1
-                        :fixture (.getName f)
+                        :fixture (file-name f)
                         :picture [(:width inputs) (:height inputs)]
                         :macroblocks (:num-mb inputs)
                         :frames n-frames
@@ -627,9 +682,9 @@
                                        :when (not= k [:full-decode :production])]
                                    [k (/ (:mean (:observation/summary o)) (double total-mean))]))}]
             (when-let [o (:out opts)]
-              (spit o (with-out-str (pp/pprint report)))
+              (.writeFileSync fs (str o) (pr-str report))
               (println "wrote" o))
-            (System/exit (if (and (every? #(:qualified? (:verdict %)) (vals pairs))
+            (js/process.exit (if (and (every? #(:qualified? (:verdict %)) (vals pairs))
                                   (empty? (noise-check total))
                                   (empty? (noise-check (get obs [:inverse-transform :shared]))))
                            exit-measured
