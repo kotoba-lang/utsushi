@@ -55,12 +55,12 @@
 
 (def root
   "Absolute repo root, derived from this file's own absolute path:
-  <root>/bench/ffmpeg-comparison/src/utsushi/bench/profile.cljk -> five
+  <root>/bench/ffmpeg-comparison/src/utsushi/bench/profile.cljk -> six
   segments up. (cwd is NOT used: `kbb -M:<alias>` and a direct
   `kbb --backend sci` run disagree on it.)"
   (let [here (str *file*)]
     (loop [s here n 0]
-      (if (= n 5)
+      (if (= n 6)
         s
         (let [i (str/last-index-of s "/")]
           (if (nil? i)
@@ -68,29 +68,38 @@
                             {:file (str *file*)}))
             (recur (subs s 0 i) (inc n))))))))
 
-(def ^:private own-prefixes
-  "Prefixes of the munged JS function names that belong to decoder code.
-  On the JVM the prefixes carried dots (`h264.`); the cljs compiler munges
-  them to `$`-separated names whose package segment is the prefix itself."
-  ["h264" "utsushi" "isobmff"])
+;; js->clj preserves camelCase: the V8 node carries :callFrame with
+;; :functionName, not :call-frame/:function-name.
+(defn- frame-name
+  "A human-readable frame label. The utsushi/h264/isobmff sources are
+  sci-eval'd by the engine (measured: their V8 frames carry url \"\" with a
+  blank function name — the munged cljs names live only in the
+  closure-compiled engine bundle, which contains none of them), so a
+  decoder frame is labelled by its eval position instead."
+  [nd]
+  (let [cf (:callFrame nd)
+        nm (or (:functionName cf) (:function-name cf))]
+    (if (str/blank? nm)
+      (if (= "" (or (:url cf) ""))
+        (str "sci@" (inc (:lineNumber cf)) ":" (:columnNumber cf))
+        "(anonymous)")
+      nm)))
 
-(defn- own? [nm]
-  (boolean (some #(str/starts-with? nm %) own-prefixes)))
+(def ^:private special-names
+  #{"(root)" "(garbage collector)" "(program)" "(idle)"})
 
-(defn- frame-name [nd]
-  (let [nm (:function-name (:call-frame nd))]
-    (if (str/blank? nm) "(anonymous)" nm)))
-
-(defn- own-frame-of
-  "The deepest own frame on the path from the sampled node to the root,
-  or nil when the whole path is runtime frames."
-  [by-id parent sid]
-  (loop [id sid]
-    (let [nm (frame-name (by-id id))]
-      (cond
-        (own? nm) nm
-        (contains? parent id) (recur (get parent id))
-        :else nil))))
+(defn- own?
+  "Is this frame decoder code? Under the sci host the decoder's frames are
+  the engine's own eval (url \"\"), which the minified engine bundle frames
+  never carry; named nbb-core frames are runtime, not decoder. GC/program
+  nodes sit at url \"\" too, so the special names are excluded explicitly —
+  a GC pause must not read as decoder time (measured: with them in, the
+  top leaf was \"(garbage collector)\")."
+  [nd]
+  (let [cf (:callFrame nd)
+        nm (or (:functionName cf) (:function-name cf))]
+    (and (= "" (or (:url cf) ""))
+         (not (special-names nm)))))
 
 (defn- tally
   "Sample counts by leaf frame and by deepest own frame, as data.
@@ -110,13 +119,19 @@
       (if (>= i (count samples))
         {:samples n :by-leaf leaf :by-own-frame own}
         (let [sid (nth samples i)
-              nm (frame-name (by-id sid))]
+              nd (by-id sid)
+              nm (frame-name nd)]
           (if (or (= nm "(idle)") (= nm "(program)"))
             (recur (inc i) leaf own n)
-            (let [o (own-frame-of by-id parent sid)]
+            (let [own-nd (loop [id sid]
+                           (let [c (by-id id)]
+                             (if (own? c)
+                               c
+                               (when (contains? parent id)
+                                 (recur (get parent id))))))]
               (recur (inc i)
                      (update leaf nm (fnil inc 0))
-                     (if o (update own o (fnil inc 0)) own)
+                     (if own-nd (update own (frame-name own-nd) (fnil inc 0)) own)
                      (inc n)))))))))
 
 (def sample-floor
@@ -180,7 +195,10 @@
              (fn [_]
                (dotimes [_ n] (decode mp4))
                (.post s "Profiler.stop"
-                      (fn [_ profile]
-                        (report! (last (str/split f #"/"))
-                                 n (count (vec (js->clj (.-samples profile))))
-                                 (tally profile)))))))))
+                      (fn [_ r]
+                        ;; The inspector wraps the profile: the stop result's
+                        ;; only key is "profile" (measured on this host).
+                        (let [profile (.-profile r)]
+                          (report! (last (str/split f #"/"))
+                                   n (count (vec (js->clj (.-samples profile))))
+                                   (tally profile))))))))))
