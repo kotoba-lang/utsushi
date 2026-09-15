@@ -75,10 +75,10 @@
             log (ffmpeg! ["-y" "-f" "lavfi" "-i" source "-frames:v" "3"
                           "-c:v" "libx264" "-profile:v" "baseline"
                           "-x264opts" x264-opts "-qp" (str qp)
-                          "-pix_fmt" "yuv420p" (.getPath out)])
+                          "-pix_fmt" "yuv420p" out])
             i16 (first (filter #(str/includes? % "mb I  I16") (str/split-lines log)))
             p (first (filter #(str/includes? % "mb P ") (str/split-lines log)))]
-        (println (format "%-18s %-9s %s" file size note))
+        (println file size note)
         (println "   " (str/trim (or i16 "NO I-frame macroblock stats reported")))
         (println "   " (str/trim (or p "NO P-frame macroblock stats reported")))
         ;; The whole point of the encoder settings is this line. If x264 chose
