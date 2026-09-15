@@ -1,0 +1,48 @@
+(ns run-suite
+  "kbb-side test runner: the kbb substitute for the JVM-only cognitect
+  `-M:test` main. Requires every test namespace, runs clojure.test/run-tests
+  over each explicitly. The suite's record is run-tests' own printed totals;
+  the exit code is decided from a with-redefs'd cljs.test/report that counts
+  :fail and :error reports as they fire (measured: the returned summary map
+  and the env vars are not reachable on the sci face)."
+  (:require [clojure.test :refer [run-tests]]
+            [utsushi.backend-test]
+            [utsushi.bench.refusal-test]
+            [utsushi.codec-encode-test]
+            [utsushi.codec-store-test]
+            [utsushi.codec-test]
+            [utsushi.pipeline.h264-mp4-test]
+            [utsushi.pipeline.mp4-h264-gop-test]
+            [utsushi.pipeline.mp4-h264-store-test]
+            [utsushi.pipeline.mp4-h264-test]
+            [utsushi.pipeline.remux-test]
+            [utsushi.pregel-test]
+            [utsushi.raster-test]))
+
+(def all-nss
+  '[utsushi.backend-test
+    utsushi.bench.refusal-test
+    utsushi.codec-encode-test
+    utsushi.codec-store-test
+    utsushi.codec-test
+    utsushi.pipeline.h264-mp4-test
+    utsushi.pipeline.mp4-h264-gop-test
+    utsushi.pipeline.mp4-h264-store-test
+    utsushi.pipeline.mp4-h264-test
+    utsushi.pipeline.remux-test
+    utsushi.pregel-test
+    utsushi.raster-test])
+
+(defn -main []
+  (println "RUN-SUITE-START")
+  (let [bad (atom 0)
+        rep cljs.test/report]
+    (with-redefs [cljs.test/report (fn [m]
+                                     (when (contains? #{:fail :error} (:type m))
+                                       (swap! bad inc))
+                                     (rep m))]
+      (apply run-tests all-nss)
+      (println "RUN-SUITE-END bad-assertions" @bad)
+      (js/process.exit (if (zero? @bad) 0 1)))))
+
+(-main)

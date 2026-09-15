@@ -1,19 +1,13 @@
 (ns utsushi.bench.profile
-  "Where utsushi's per-frame time actually goes — a sampling profile, not a guess.
+  "Where the per-frame time goes, under a sampling profiler.
 
-  The comparison bench answers HOW MUCH slower utsushi is than ffmpeg. It
-  cannot answer WHERE that time is spent, and at tens to hundreds of
-  milliseconds of CPU per frame the gap is very unlikely to be uniform.
-  Guessing which of entropy decode, the transforms, or boxed arithmetic
-  dominates would direct every later decision off a hunch.
-
-  This runs the same decode the bench times, under a JFR execution-sample
-  recording, and aggregates the samples two ways:
+  This runs the same decode the bench times, under a sampling CPU
+  profiler, and aggregates the samples two ways:
 
   - by the LEAF frame — where the CPU actually is;
   - by the deepest frame inside `h264.*` / `utsushi.*` / `isobmff.*`, which
-    attributes JDK-internal leaves (`clojure.lang.*`, boxing, hashing) back to
-    the decoder code that called them.
+    attributes runtime-internal leaves (boxing, seq traversal, hashing)
+    back to the decoder code that called them.
 
   A sampling profile is a distribution over samples, not a measurement of any
   one call. The sample count is printed and compared against `sample-floor`, so
@@ -22,104 +16,189 @@
   NOT run inside the comparison: a profiler attached to a timed interval
   measures the profiler.
 
-  ## Why every form here is `#?(:clj …)`
+  ## The instrument changed with the runtime, deliberately
 
-  This file is JVM-only and says so rather than pretending otherwise. JFR is a
-  JVM facility, and the arm it profiles is the JVM incumbent oracle — which
-  ADR-2607198300 names as explicitly NOT the destination. When a kotoba backend
-  can run the decoder, profiling it will need a different instrument against a
-  different runtime, not a port of this one. Writing that as a reader
-  conditional keeps the fact in the source instead of in a reader's memory.
+  The JVM incumbent ran this under a JFR execution-sample recording. JFR is a
+  JVM facility, and ADR-2607198300 names the JVM as explicitly NOT the
+  destination. When the decoder moved to the kbb/js host, the instrument moved
+  with it: this file now records a V8 CPU profile over `node:inspector`'s
+  `Profiler` domain against the same decode. That is a DIFFERENT instrument
+  against a DIFFERENT runtime, not a port of the JFR one, and its numbers are
+  not comparable with the JFR numbers recorded in the README — the JVM
+  findings there (picture assembly + residual addition dominate,
+  ~78% of leaf samples in collection machinery) remain the JFR instrument's
+  claims about the JVM arm.
+
+  Faces that do not survive the instrument change, on purpose:
+
+  - Leaf frame names are the JS function names the cljs compiler emits
+    (`h264$decode$decode_gop`), not JVM class/method pairs.
+  - The V8 profiler samples idle ticks too; `(idle)` and `(program)` nodes
+    are EXCLUDED from the sample count and the tables, because JFR
+    execution-sample only saw a running thread and a sample count padded
+    with idle time would flatter the `sample-floor` comparison.
 
   Run: `kbb -M:bench-profile [fixture.mp4] [iterations]`"
-  #?(:clj (:require [clojure.java.io :as io]
-                    [kotoba.lang.text :as str]))
-  #?(:clj (:import [jdk.jfr Recording]
-                   [jdk.jfr.consumer RecordingFile RecordedEvent RecordedFrame]))
-  #?(:clj (:gen-class)))
+  (:require [kotoba.lang.text :as str]
+            [utsushi.pipeline.mp4-h264 :as pipeline]
+            [utsushi.bench.host :as host]))
 
-#?(:clj
-   (defn- read-bytes [^java.io.File f]
-     (with-open [in (io/input-stream f)]
-       (mapv #(bit-and (int %) 0xff) (.readAllBytes in)))))
+;; Host boundary: filesystem reads live in these two fns and nowhere else;
+;; everything downstream consumes plain data (bytes as numbers 0..255).
+(defn- exists-file? [p]
+  (try (and (.existsSync (js/require "fs") (str p))
+            (not (.isDirectory (.statSync (js/require "fs") (str p)))))
+       (catch :default _ false)))
 
-#?(:clj (def ^:private own-prefixes ["h264." "utsushi." "isobmff."]))
+(defn- read-bytes [p]
+  (vec (.values (js/Uint8Array. (.readFileSync (js/require "fs") (str p))))))
 
-#?(:clj
-   (defn- own? [^String cls]
-     (boolean (some #(str/starts-with? cls ^String %) own-prefixes))))
+(def root
+  "Absolute repo root, derived from this file's own absolute path:
+  <root>/bench/ffmpeg-comparison/src/utsushi/bench/profile.cljk -> six
+  segments up. (cwd is NOT used: `kbb -M:<alias>` and a direct
+  `kbb --backend sci` run disagree on it.)"
+  (let [here (str *file*)]
+    (loop [s here n 0]
+      (if (= n 6)
+        s
+        (let [i (str/last-index-of s "/")]
+          (if (nil? i)
+            (throw (ex-info "utsushi.bench.profile: cannot derive repo root from *file*"
+                            {:file (str *file*)}))
+            (recur (subs s 0 i) (inc n))))))))
 
-#?(:clj
-   (defn- frame-name [^RecordedFrame fr]
-     (let [m (.getMethod fr)]
-       (str (.getName (.getType m)) "/" (.getName m)))))
+;; js->clj preserves camelCase: the V8 node carries :callFrame with
+;; :functionName, not :call-frame/:function-name.
+(defn- frame-name
+  "A human-readable frame label. The utsushi/h264/isobmff sources are
+  sci-eval'd by the engine (measured: their V8 frames carry url \"\" with a
+  blank function name — the munged cljs names live only in the
+  closure-compiled engine bundle, which contains none of them), so a
+  decoder frame is labelled by its eval position instead."
+  [nd]
+  (let [cf (:callFrame nd)
+        nm (or (:functionName cf) (:function-name cf))]
+    (if (str/blank? nm)
+      (if (= "" (or (:url cf) ""))
+        (str "sci@" (inc (:lineNumber cf)) ":" (:columnNumber cf))
+        "(anonymous)")
+      nm)))
 
-#?(:clj
-   (defn- tally
-     "Sample counts by leaf frame and by deepest own frame, as data."
-     [^java.io.File jfr]
-     (with-open [rf (RecordingFile. (.toPath jfr))]
-       (loop [leaf {} own {} n 0]
-         (if-not (.hasMoreEvents rf)
-           {:samples n :by-leaf leaf :by-own-frame own}
-           (let [^RecordedEvent e (.readEvent rf)]
-             (if-not (= "jdk.ExecutionSample" (.getName (.getEventType e)))
-               (recur leaf own n)
-               (let [names (mapv frame-name (.getFrames (.getStackTrace e)))
-                     l (first names)
-                     o (first (filter own? names))]
-                 (recur (update leaf l (fnil inc 0))
-                        (if o (update own o (fnil inc 0)) own)
-                        (inc n))))))))))
+(def ^:private special-names
+  #{"(root)" "(garbage collector)" "(program)" "(idle)"})
 
-#?(:clj
-   (def sample-floor
-     "Below this many execution samples the percentages are shape, not
-     measurement. Measured: 5 decodes of the 3-frame 320x240 fixture yielded 64
-     samples, at which a 3% entry is two samples. The floor is printed and named
-     rather than left to the reader to notice a small n."
-     200))
+(defn- own?
+  "Is this frame decoder code? Under the sci host the decoder's frames are
+  the engine's own eval (url \"\"), which the minified engine bundle frames
+  never carry; named nbb-core frames are runtime, not decoder. GC/program
+  nodes sit at url \"\" too, so the special names are excluded explicitly —
+  a GC pause must not read as decoder time (measured: with them in, the
+  top leaf was \"(garbage collector)\")."
+  [nd]
+  (let [cf (:callFrame nd)
+        nm (or (:functionName cf) (:function-name cf))]
+    (and (= "" (or (:url cf) ""))
+         (not (special-names nm)))))
 
-#?(:clj
-   (defn- print-table [title total m limit]
-     (println)
-     (println title)
-     (if (zero? total)
-       (println "  NO SAMPLES — this profile measured nothing; do not quote it")
-       (doseq [[k v] (take limit (sort-by (comp - val) m))]
-         (println (format "  %5.1f%%  %6d  %s" (* 100.0 (/ (double v) total)) v k))))))
+(defn- tally
+  "Sample counts by leaf frame and by deepest own frame, as data.
 
-#?(:clj
-   (defn -main [& [fixture iters]]
-     (let [decode (requiring-resolve 'utsushi.pipeline.mp4-h264/decode-h264-frames)
-           load1 (requiring-resolve 'utsushi.bench.host/load1)
-           f (io/file "bench/ffmpeg-comparison/fixtures" (or fixture "gop320x240.mp4"))]
-       (when-not (.isFile f)
-         (println "no such fixture:" (.getPath f))
-         (System/exit 3))
-       (let [mp4 (read-bytes f)
-             n (Long/parseLong (or iters "3"))
-             jfr (java.io.File/createTempFile "utsushi-profile" ".jfr")
-             rec (Recording.)]
-         (dotimes [_ 3] (decode mp4))              ; warm-up outside the recording
-         (doto rec
-           (.setSettings {"jdk.ExecutionSample#enabled" "true"
-                          "jdk.ExecutionSample#period" "1 ms"})
-           (.setMaxSize 512000000)
-           (.start))
-         (dotimes [_ n] (decode mp4))
-         (.stop rec)
-         (.dump rec (.toPath jfr))
-         (.close rec)
-         (let [{:keys [samples by-leaf by-own-frame]} (tally jfr)]
-           (println (format "fixture %s   decodes recorded %d   execution samples %d   load1 %s"
-                            (.getName f) n samples (str (load1))))
-           (when (< samples sample-floor)
-             (println (format "THIN PROFILE: %d samples < floor %d — raise the iteration count; do not quote these percentages"
-                              samples sample-floor)))
-           (print-table "BY LEAF FRAME — where the CPU is" samples by-leaf 20)
-           (print-table "BY DEEPEST DECODER FRAME — which decoder code spends it" samples by-own-frame 20)
-           (.delete jfr)
-           (when (zero? samples)
-             (println "REFUSING to report a profile of nothing")
-             (System/exit 3)))))))
+  `(idle)`/`(program)` nodes are excluded entirely — see the docstring —
+  so the returned `:samples` is the count of samples that saw the CPU
+  running decoder or runtime code, the face JFR's execution-sample
+  recorded."
+  [profile]
+  (let [nodes (js->clj (.-nodes profile) :keywordize-keys true)
+        by-id (into {} (map (fn [nd] [(:id nd) nd]) nodes))
+        parent (into {} (mapcat (fn [nd] (map (fn [cid] [cid (:id nd)])
+                                              (:children nd)))
+                                nodes))
+        samples (vec (js->clj (.-samples profile)))]
+    (loop [i 0 leaf {} own {} n 0]
+      (if (>= i (count samples))
+        {:samples n :by-leaf leaf :by-own-frame own}
+        (let [sid (nth samples i)
+              nd (by-id sid)
+              nm (frame-name nd)]
+          (if (or (= nm "(idle)") (= nm "(program)"))
+            (recur (inc i) leaf own n)
+            (let [own-nd (loop [id sid]
+                           (let [c (by-id id)]
+                             (if (own? c)
+                               c
+                               (when (contains? parent id)
+                                 (recur (get parent id))))))]
+              (recur (inc i)
+                     (update leaf nm (fnil inc 0))
+                     (if own-nd (update own (frame-name own-nd) (fnil inc 0)) own)
+                     (inc n)))))))))
+
+(def sample-floor
+  "Below this many execution samples the percentages are shape, not
+  measurement. Measured under the JFR instrument: 5 decodes of the 3-frame
+  320x240 fixture yielded 64 samples, at which a 3% entry is two samples.
+  The floor is printed and named rather than left to the reader to notice a
+  small n."
+  200)
+
+(defn- pct-str [v total]
+  (str (.toFixed (* 100.0 (/ (double v) (double total))) 1) "%"))
+
+(defn- print-table [title total m limit]
+  (println)
+  (println title)
+  (if (zero? total)
+    (println "  NO SAMPLES — this profile measured nothing; do not quote it")
+    (doseq [[k v] (take limit (sort-by (comp - val) m))]
+      (println (str "  " (pct-str v total) "  " v "  " k)))))
+
+(defn- report!
+  "The report, and the refusal to report a profile of nothing. Runs inside
+  the Profiler.stop callback: the inspector round-trip is async, so the
+  callback is where the recording is actually over. Exits 3 on zero
+  samples — the same could-not-measure exit the JVM file used."
+  [fixture-name n decodes {:keys [samples by-leaf by-own-frame]}]
+  (println (str "fixture " fixture-name
+                "   decodes recorded " decodes
+                "   execution samples " samples
+                "   load1 " (str (host/load1))))
+  (when (< samples sample-floor)
+    (println (str "THIN PROFILE: " samples " samples < floor " sample-floor
+                  " — raise the iteration count; do not quote these percentages")))
+  (print-table "BY LEAF FRAME — where the CPU is" samples by-leaf 20)
+  (print-table "BY DEEPEST DECODER FRAME — which decoder code spends it"
+               samples by-own-frame 20)
+  (when (zero? samples)
+    (println "REFUSING to report a profile of nothing")
+    (js/process.exit 3))
+  (js/process.exit 0))
+
+(defn -main [& [fixture iters]]
+  (let [f (str root "/bench/ffmpeg-comparison/fixtures/"
+               (or fixture "gop320x240.mp4"))
+        n (js/parseInt (or iters "3") 10)
+        decode pipeline/decode-h264-frames]
+    (when-not (exists-file? f)
+      (println "no such fixture:" f)
+      (js/process.exit 3))
+    (when-not (pos? n)
+      (println "iterations must be a positive integer, got:" (str iters))
+      (js/process.exit 3))
+    (let [mp4 (read-bytes f)
+          Session (.-Session (js/require "inspector"))
+          s (Session.)]
+      (dotimes [_ 3] (decode mp4))          ; warm-up outside the recording
+      (.connect s)
+      (.post s "Profiler.enable")
+      (.post s "Profiler.start"
+             (fn [_]
+               (dotimes [_ n] (decode mp4))
+               (.post s "Profiler.stop"
+                      (fn [_ r]
+                        ;; The inspector wraps the profile: the stop result's
+                        ;; only key is "profile" (measured on this host).
+                        (let [profile (.-profile r)]
+                          (report! (last (str/split f #"/"))
+                                   n (count (vec (js->clj (.-samples profile))))
+                                   (tally profile))))))))))
