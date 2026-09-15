@@ -62,7 +62,9 @@
   "Ordered. `stage-index` is used to report which engine got furthest."
   [:cli :source-read :check :compile :execute])
 
-(defn stage-index [s] (.indexOf ^java.util.List stage-ladder s))
+;; kbb/js: no java.util.List type hint survives kbb — indexOf over a plain
+;; JS array keeps the same ordered-ladder semantics.
+(defn stage-index [s] (.indexOf (into-array stage-ladder) s))
 
 ;; ── locating the kotoba toolchain ────────────────────────────────────────
 ;;
