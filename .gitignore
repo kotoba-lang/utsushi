@@ -22,3 +22,4 @@
 ;; copied verbatim for utsushi.codec.store's integration test — same "small
 ;; real fixture is committed" exception as the .mp4 rule above.
 !resources/utsushi/fixtures/*.h264
+.nbb/
