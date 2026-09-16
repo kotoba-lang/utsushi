@@ -21,9 +21,14 @@
 ;; utsushi.codec.store の `:db-api` 注入パターン（MemStore ≡ DatomicStore
 ;; contract、actor 系と同型）の手本かつ実体（langchain.db/api）。
 ;;
-;; multi-frame decode（GOP: IDR + P-frames）: org-iso-h264 を 55ffcdd → 9bff54f
-;; （main tip、34 commits ahead / 0 behind、merge-base == 55ffcdd = 純 fast-forward。
-;; `gh api repos/kotoba-lang/org-iso-h264/compare/55ffcdd...9bff54f` で確認）へ更新。
+;; multi-frame decode（GOP: IDR + P-frames）: org-iso-h264 を 9bff54f → de99083
+;; （main tip、21 commits ahead / 0 behind、merge-base == 9bff54f = 純 fast-forward。
+;; `gh api repos/kotoba-lang/org-iso-h264/compare/9bff54f...de99083` で確認）へ更新。
+;; 9bff54f は I_NxN (Intra_4x4) を throw するだけだったが、de99083 の decode-gop は
+;; CAVLC I-slice の I_NxN decode（全 9 pred modes、ffmpeg golden 済）を持ち、
+;; libx264 実出力の Intra_4x4 を decode できる。utsushi の mp4_h264_gop_test の
+;; 拒否テストは decode テストに書き替えた（ref.yuv 未同梱のため構造的 assert）。
+;;
 ;; 55ffcdd には `h264.decode/decode-gop` が存在せず、decode できるのは 1 枚目の IDR
 ;; だけだった。9bff54f の decode-gop は 1 本の Annex B ストリームから全ピクチャを
 ;; 順に decode し、各 P-slice は直前の復号ピクチャを単一参照フレームにする。
@@ -41,7 +46,7 @@
         ;; this repo silently rides whatever a sibling happens to name.
         io.github.kotoba-lang/text {:git/sha "73bdb13ae7a3d004b44bca08be03a3191157a38f"}
        io.github.kotoba-lang/org-iso-isobmff {:git/sha "50fbdbbeb5be30d8cab63877b220b7079a23b4a1"}
-         io.github.kotoba-lang/org-iso-h264    {:git/sha "9bff54f1f1d7f24f9ff968285a2fc59e376fc9e5"}
+         io.github.kotoba-lang/org-iso-h264    {:git/sha "de99083a368083f42c096f59388dc5798d85fbaf"}
          io.github.kotoba-lang/langchain       {:git/sha "0f966d06c93d7fc76b0790fdece4c391dc257eb1"}}
  :aliases
  {;; ffmpeg comparison benchmark — see bench/ffmpeg-comparison/README.md.

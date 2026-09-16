@@ -22,19 +22,22 @@
    |---|---|---|
    | `mp4-h264-gop32x3.mp4` | I,P,P | I-slice + P-slices mixing P_L0_16x16 with CAVLC intra macroblocks |
    | `mp4-h264-skip32x3.mp4` | I,P,P | I-slice + P-slices that are 100% P_Skip |
-   | `mp4-h264-i4x4-reject.mp4` | I,P,P | the REJECTION: an I-frame containing Intra_4x4 |
+   | `mp4-h264-i4x4-reject.mp4` | I,P,P | an I-frame containing Intra_4x4 (now DECODED, see below) |
 
-   ## The rejection is not a corner case
+   ## Intra_4x4 used to be refused; now it decodes
 
    libx264 cannot be told to stop using Intra_4x4. `--partitions none`
    zeroes `analyse.inter` only; x264's own printed parameter line still
    reads `analyse=0x1:0`, and `0x1` is `X264_ANALYSE_I4x4`. Measured on
    the three content variants tried for this test, x264 chose Intra_4x4
    for 8.3%-25% of I-frame macroblocks on anything with detail in it, and
-   0% only on fully flat content. So `org-iso-h264`'s missing `I_NxN`
-   path is the boundary between 'decodes real encoder output' and
-   'doesn't', and this suite asserts BOTH sides of it rather than only
-   the side that passes.
+   0% only on fully flat content. org-iso-h264 was therefore advanced
+   9bff54f -> de99083 (pure fast-forward, 21 commits, 0 behind), whose
+   `decode-gop` implements CAVLC I-slice I_NxN across all nine prediction
+   modes — validated bit-exact against ffmpeg goldens in org-iso-h264's
+   OWN suite (`test/h264/decode_test.cljk`, `i4x4-mandel64-golden-vector`).
+   The fixture name `mp4-h264-i4x4-reject` is historical; it is asserted
+   as a DECODE here.
 
    ## What is NOT covered
 
@@ -43,7 +46,9 @@
    content has nothing to displace. `decode-gop`'s sub-pel motion
    compensation (`h264.interp`) is therefore NOT exercised by any real
    encoder output here — that gap is real and is recorded rather than
-   papered over with a synthetic bitstream."
+   papered over with a synthetic bitstream. This fixture also has no
+   `.ref.yuv` yet, so the i4x4 test asserts STRUCTURE (see its RECORDED
+   GAP block) rather than bit-exact pixels."
   (:require [clojure.test :refer [deftest is testing]]
             [utsushi.test-host :as th]
             [isobmff.demux :as demux]
@@ -100,22 +105,43 @@
     (testing "the P-frames are entirely P_Skip"
       (is (every? #(every? #{:p-skip} (:mb-sub-types %)) (rest frames))))))
 
-(deftest intra-4x4-from-a-real-encoder-is-refused-precisely
-  (testing "real libx264 output containing Intra_4x4 is refused by name, not
-            silently mis-decoded — libx264 cannot be configured to avoid it
-            (--partitions none leaves analyse=0x1:0 = X264_ANALYSE_I4x4)"
+(deftest intra-4x4-from-a-real-encoder-decodes
+  (testing "real libx264 output containing Intra_4x4 now DECODES — org-iso-h264
+            advanced 9bff54f -> de99083, whose decode-gop implements CAVLC
+            I-slice I_NxN (Intra_4x4) across all nine §8.3.1.2 prediction
+            modes (ffmpeg-bit-exact goldens live in org-iso-h264's own
+            decode_test). The old refusal (mb_type 0 throw) is gone by design:
+            libx264 cannot be told to avoid Intra_4x4 (--partitions none
+            leaves analyse=0x1:0), so a refusal made real encoder output
+            undecodable."
     (let [mp4 (rd-bytes "utsushi/fixtures/mp4-h264-i4x4-reject.mp4")
-          e (is (thrown? js/Error (pipeline/decode-h264-frames mp4)))]
-      (is (= 0 (:mb-type (ex-data e)))
-          "mb_type 0 in an I-slice is I_NxN")
-      (is (= "I_NxN (Intra_4x4/8x8) not implemented" (:reason (ex-data e)))
-          "the refusal names the missing syntax element, so a reader knows what
-           to implement rather than that 'decoding failed'")))
-  (testing "and the fixture really is a three-picture GOP — i.e. it is refused
-            for its macroblock type, not for being malformed or empty"
-    (let [track (pipeline/video-track
-                 (demux/demux (rd-bytes "utsushi/fixtures/mp4-h264-i4x4-reject.mp4")))]
-      (is (= 3 (count (:samples track)))))))
+          frames (pipeline/decode-h264-frames mp4)
+          idr (nth frames 0)]
+      (testing "the whole GOP decodes: 3 pictures, I then P,P"
+        (is (= 3 (count frames)))
+        (is (= [:i :p :p] (mapv :slice-type-class frames))))
+      (testing "the IDR really exercises Intra_4x4 — structural, checked BEFORE
+                any pixel claim could be made, mirroring org-iso-h264's
+                assert-i4x4-coverage! discipline"
+        (is (some true? (:mb-i4x4? idr))
+            "at least one macroblock decoded through the I_NxN path")
+        (is (every? nil? (map (fn [i4x4? mode] (when i4x4? mode))
+                              (:mb-i4x4? idr) (:mb-pred-modes idr)))
+            "an I_NxN macroblock has no Intra_16x16 pred mode — the two keys
+             must agree about which macroblocks are I_NxN")
+        (is (seq (remove nil? (flatten (filter identity (:mb-i4x4-modes idr)))))
+            "the I_NxN macroblocks resolved real Intra4x4PredModes"))
+      (testing "every decoded picture carries full-size planes (fixture is 64x64)"
+        (doseq [f frames]
+          (is (= 4096 (count (:luma f))))
+          (is (= 1024 (count (:cb f))))
+          (is (= 1024 (count (:cr f))))))))
+  (testing "RECORDED GAP: this fixture has no `.ref.yuv` yet, so unlike its
+            two siblings this test asserts structure (frame count, slice
+            classes, I_NxN coverage) rather than bit-exact pixels. Generate
+            the reference — ffmpeg -i mp4-h264-i4x4-reject.mp4 -pix_fmt
+            yuv420p mp4-h264-i4x4-reject.ref.yuv — and add the same
+            bit-exact plane comparison the other two fixtures assert."))
 
 (deftest track->annexb-carries-every-sample
   (testing "the multi-frame Annex B stream carries the parameter sets once and

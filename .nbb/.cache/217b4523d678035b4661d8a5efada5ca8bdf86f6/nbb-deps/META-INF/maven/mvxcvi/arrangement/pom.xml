@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>mvxcvi</groupId>
+  <artifactId>arrangement</artifactId>
+  <packaging>jar</packaging>
+  <version>2.1.0</version>
+  <name>arrangement</name>
+  <description>Total-order comparator for Clojure(Script).</description>
+  <url>https://github.com/greglook/clj-arrangement</url>
+  <licenses>
+    <license>
+      <name>Public Domain</name>
+      <url>http://unlicense.org/</url>
+    </license>
+  </licenses>
+  <scm>
+    <url>https://github.com/greglook/clj-arrangement</url>
+    <connection>scm:git:git://github.com/greglook/clj-arrangement.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/greglook/clj-arrangement.git</developerConnection>
+    <tag>4428958f130e93a170735c4b792a801041fdf23e</tag>
+  </scm>
+  <build>
+    <sourceDirectory>src</sourceDirectory>
+    <testSourceDirectory>test</testSourceDirectory>
+    <resources>
+      <resource>
+        <directory>resources</directory>
+      </resource>
+    </resources>
+    <testResources>
+      <testResource>
+        <directory>resources</directory>
+      </testResource>
+    </testResources>
+    <directory>target</directory>
+    <outputDirectory>target/classes</outputDirectory>
+    <plugins/>
+  </build>
+  <repositories>
+    <repository>
+      <id>central</id>
+      <url>https://repo1.maven.org/maven2/</url>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+    </repository>
+    <repository>
+      <id>clojars</id>
+      <url>https://repo.clojars.org/</url>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+    </repository>
+  </repositories>
+  <dependencyManagement>
+    <dependencies/>
+  </dependencyManagement>
+  <dependencies/>
+</project>
