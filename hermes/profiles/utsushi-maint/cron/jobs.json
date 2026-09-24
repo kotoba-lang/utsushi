@@ -1,0 +1,52 @@
+{
+  "jobs": [
+    {
+      "base_url": null,
+      "context_from": null,
+      "deliver": "local",
+      "enabled": true,
+      "enabled_toolsets": null,
+      "id": "3ed2c634d9c6",
+      "model": null,
+      "name": "utsushi-jvmfree-measure",
+      "no_agent": true,
+      "prompt": "utsushi JVM-free evidence: JVM 依存残数を実測し ledger に追加",
+      "provider": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/20 * * * *",
+        "display": "*/20 * * * *"
+      },
+      "script": "utsushi_jvmfree_evidence.py",
+      "skill": null,
+      "skills": [],
+      "workdir": null
+    },
+    {
+      "base_url": null,
+      "context_from": null,
+      "deliver": "local",
+      "enabled": true,
+      "enabled_toolsets": null,
+      "id": "f091869ecc12",
+      "model": null,
+      "name": "utsushi-jvmfree-land",
+      "no_agent": false,
+      "prompt": "utsushi-maint: SOUL.md を読んで 1 tick 実行せよ。まず scripts/utsushi_jvmfree_evidence.py を実行し MEASURE 行を読む。次に 1 wave だけ worktree（/tmp/utsushi-jvmfree-<date>、branch bot/utsushi-jvmfree-$(date +%Y%m%d-%H%M)、分岐元は main）で JVM 依存を kotoba.io/kotoba.lang.fs へ移植し、kbb suite 緑を verify したら branch push → gh api merges で着地。JVM 起動コマンド（java/clojure/clj/bb）は打たない。進捗 0 なら「0」と正直に報告し次の 1 手を名指す。報告はレシート式（wave / verify rc / jvm_dep_file_hits / 台帳 seq）。",
+      "provider": null,
+      "schedule": {
+        "kind": "cron",
+        "expr": "15 */2 * * *",
+        "display": "15 */2 * * *"
+      },
+      "script": null,
+      "skill": "java-kotoba-migration",
+      "skills": [
+        "java-kotoba-migration",
+        "kbb-test-suite-fix",
+        "kbb-config-and-classpath"
+      ],
+      "workdir": null
+    }
+  ]
+}
