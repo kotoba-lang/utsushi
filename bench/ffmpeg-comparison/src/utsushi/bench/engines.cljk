@@ -43,7 +43,7 @@
   exit 70 `:kotoba/target-rejected`, wasm32 exit 70
   `:kotoba/internal-error`."
   (:require [kotoba.lang.text :as str]
-            [clojure.edn :as edn]))
+            [kotoba.lang.edn :as edn]))
 
 ;; Host boundary: process/filesystem probes live here and nowhere else, and
 ;; every fn returns plain data (paths as strings, {:exit :out :err} maps).

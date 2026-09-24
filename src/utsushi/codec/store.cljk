@@ -87,7 +87,7 @@
   attributes (nothing reads it structurally; it's purely diagnostic)."
   (:require [langchain.db :as db]
             [h264.decode :as h264-decode]
-            #?(:clj [clojure.edn :as edn]
+            #?(:clj [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])))
 
 (def decode-schema
