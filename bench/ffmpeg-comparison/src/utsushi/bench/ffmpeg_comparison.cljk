@@ -94,7 +94,7 @@
 
   Run: `kbb -M:bench` (add `--samples N`, `--stretch N`, `--out FILE`)."
   (:require [kotoba.lang.text :as str]
-            [clojure.edn :as edn]
+            [kotoba.lang.edn :as edn]
             [perfgate.core :as g]
             [utsushi.bench.host :as host]
             [utsushi.bench.engines :as engines]
