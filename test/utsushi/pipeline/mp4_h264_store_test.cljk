@@ -2,7 +2,7 @@
   "Integration test wiring `utsushi.pipeline.mp4-h264` (real MP4 → Annex B
    bytes) directly into `utsushi.codec.store/decode-frame!` (Annex B bytes →
    persisted decode-state job), the two independently-landed R0.5 features
-   (ADR-2606272200 / ADR-2607122000 Phase 1) this repo's CLAUDE.md flags as
+   (ADR-2606272200 / ADR-2607122000 Phase 1) this repo's AGENTS.md flags as
    \"already composable, but never actually connected in a test\".
 
    Neither `utsushi.pipeline.mp4-h264-test` (which calls

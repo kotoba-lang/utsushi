@@ -63,7 +63,7 @@
   - `:decode/frame-blob` — the reconstructed frame. **Scope note**: the ADR
                            text's ideal is a Vault blob CID reference, but
                            `utsushi` has no Vault blob integration wired yet
-                           (its own CLAUDE.md's \"media 実体は Vault blob +
+                           (its own AGENTS.md's \"media 実体は Vault blob +
                            CID 参照のみ\" invariant is aspirational, not yet
                            implemented anywhere in this repo — `utsushi.quads`
                            documents the target shape but nothing populates

@@ -11,7 +11,7 @@
 
   ## utsushi 自身の不変条件が測定で裏付けられた（2026-07-30）
 
-  このリポの CLAUDE.md は最初からこう書いている:
+  このリポの AGENTS.md は最初からこう書いている:
 
   > libavcodec を `.kotoba`/cljc で再実装しない。codec 内側ループは純 cljc では
   > framerate で回らない（**SIMD/threads 無し**・fuel・streaming 不可）
